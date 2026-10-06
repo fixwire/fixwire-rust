@@ -1,0 +1,9 @@
+[workspace]
+resolver = "3"
+members = ["fixwire"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/fixwire/fixwire-rust"
