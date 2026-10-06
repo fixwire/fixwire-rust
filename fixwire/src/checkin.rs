@@ -6,6 +6,7 @@ use serde_json::{Map, Value, json};
 
 use crate::client::{Client, new_id};
 use crate::hub::{Hub, guarded};
+use crate::limits;
 use crate::transport::Category;
 
 /// How a scheduled job's run is going.
@@ -115,10 +116,13 @@ impl Client {
             if let Some(d) = check_in.duration {
                 body["duration"] = d.as_secs_f64().into();
             }
+            // The monitor's slug and config are the app's own: cut, not redacted.
+            let limit = self.options().max_value_length;
             if let Some(c) = &check_in.config {
-                body["monitor_config"] = c.to_json();
+                body["monitor_config"] = limits::cut_strings(c.to_json(), limit);
             }
-            let path = format!("/v1/check-ins/{}", percent_encode(&check_in.monitor));
+            let monitor = limits::cut(&check_in.monitor, limit, false);
+            let path = format!("/v1/check-ins/{}", percent_encode(&monitor));
             self.send_json(&path, Category::CheckIn, &body)
                 .then_some(id)
         })
@@ -286,7 +290,12 @@ impl Hub {
         body.insert("timestamp".into(), timestamp.into());
         body.insert(
             "source".into(),
-            f.source.unwrap_or_else(|| "api".into()).into(),
+            limits::cut(
+                f.source.as_deref().unwrap_or("api"),
+                client.options().max_value_length,
+                false,
+            )
+            .into(),
         );
         body.insert(
             "environment".into(),

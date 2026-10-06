@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::limits;
 use crate::types::{Breadcrumb, Event};
 
 /// Changes an event before it is sent, or drops it (`None`).
@@ -226,6 +227,22 @@ impl Options {
         }
         // Room for the "..." that ends a cut string.
         self.max_value_length = self.max_value_length.max(3);
+        // The app's own configuration is cut like any string, but not redacted: masking
+        // `api@1.2.3.example` as an email would break release health.
+        let limit = self.max_value_length;
+        for s in [
+            &mut self.release,
+            &mut self.environment,
+            &mut self.server_name,
+            &mut self.service_name,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if s.len() > limit {
+                *s = limits::cut(s, limit, false).into_owned();
+            }
+        }
         if self.max_stack_frames == 0 {
             self.max_stack_frames = 100;
         }

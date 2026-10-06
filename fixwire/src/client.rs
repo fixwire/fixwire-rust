@@ -37,6 +37,25 @@ impl Client {
     pub fn new(opts: Options) -> Result<Client, InvalidDsn> {
         let opts = opts.with_defaults();
         let dsn: Option<Dsn> = opts.dsn.as_deref().map(str::parse).transpose()?;
+        Ok(Client::with_dsn(opts, dsn))
+    }
+
+    /// A client for `opts`, or a disabled one when the DSN (given or in
+    /// `FIXWIRE_DSN`) is invalid, which is said on stderr: what `init` sets
+    /// up, so a typo can't stop the app.
+    pub(crate) fn new_or_off(opts: Options) -> Client {
+        let mut opts = opts.with_defaults();
+        match opts.dsn.as_deref().map(str::parse).transpose() {
+            Ok(dsn) => Client::with_dsn(opts, dsn),
+            Err(e) => {
+                eprintln!("{e}: the SDK is off");
+                opts.dsn = None;
+                Client::with_dsn(opts, None)
+            }
+        }
+    }
+
+    fn with_dsn(opts: Options, dsn: Option<Dsn>) -> Client {
         let redactor = (dsn.is_some() && opts.redact).then(|| match &opts.sensitive_keys {
             None => Redactors::Shared(Redactor::default_shared()),
             Some(keys) => Redactors::Own(Box::new(Redactor::new(Some(keys)))),
@@ -47,13 +66,13 @@ impl Client {
             let environment = opts.environment.clone().unwrap_or_default();
             Aggregates::start(Arc::clone(t), release, environment, opts.session_interval)
         });
-        Ok(Client {
+        Client {
             budget: Budget::new(opts.error_budget.clone()),
             opts,
             transport,
             redactor,
             sessions,
-        })
+        }
     }
 
     /// The client's options, defaults filled in.

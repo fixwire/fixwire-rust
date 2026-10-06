@@ -348,7 +348,7 @@ fn short_file(path: &str, root: Option<&Path>) -> String {
 }
 
 /// The lines of the files frames point to, kept for the next events: files
-/// of at most 10 MB are read, and at most 64 files and 40 MB kept.
+/// of at most 10 MB are read, and at most 64 files and 32 MB kept.
 #[derive(Default)]
 struct Sources {
     files: HashMap<String, Vec<String>>,
@@ -357,7 +357,22 @@ struct Sources {
 static SOURCES: LazyLock<Mutex<Sources>> = LazyLock::new(Default::default);
 const MAX_SOURCE_FILES: usize = 64;
 const MAX_SOURCE_BYTES: u64 = 10 << 20;
-const MAX_CACHED_BYTES: u64 = 4 * MAX_SOURCE_BYTES;
+const MAX_CACHED_BYTES: u64 = 32 << 20;
+
+impl Sources {
+    /// Keeps a file's lines: when it would make more than 64 files or
+    /// 32 MB, the cache starts over.
+    fn insert(&mut self, path: &str, text: &str) {
+        let size = text.len() as u64;
+        if self.files.len() >= MAX_SOURCE_FILES || self.bytes + size > MAX_CACHED_BYTES {
+            self.files.clear();
+            self.bytes = 0;
+        }
+        self.bytes += size;
+        self.files
+            .insert(path.to_owned(), text.lines().map(str::to_owned).collect());
+    }
+}
 /// The source lines read above and below a frame's line, at most.
 const MAX_CONTEXT_LINES: usize = 5;
 
@@ -365,12 +380,8 @@ fn add_context(f: &mut Frame, around: usize) {
     let (Some(path), Some(line)) = (f.abs_path.as_deref(), f.line) else {
         return;
     };
-    let mut guard = lock(&SOURCES);
-    let Sources {
-        files: sources,
-        bytes: cached,
-    } = &mut *guard;
-    if !sources.contains_key(path) {
+    let mut sources = lock(&SOURCES);
+    if !sources.files.contains_key(path) {
         // Regular files only: opening a FIFO waits for a writer, and a device may never end.
         let text = std::fs::metadata(path)
             .ok()
@@ -384,15 +395,9 @@ fn add_context(f: &mut Frame, around: usize) {
                     .map(|_| text)
             })
             .unwrap_or_default();
-        let size = text.len() as u64;
-        if sources.len() >= MAX_SOURCE_FILES || *cached + size > MAX_CACHED_BYTES {
-            sources.clear();
-            *cached = 0;
-        }
-        *cached += size;
-        sources.insert(path.to_owned(), text.lines().map(str::to_owned).collect());
+        sources.insert(path, &text);
     }
-    let lines = &sources[path];
+    let lines = &sources.files[path];
     let i = line as usize;
     if i == 0 || i > lines.len() {
         return;
@@ -534,6 +539,29 @@ mod tests {
             ..Options::default()
         };
         assert!(in_app(Some("serde::de"), None, root, Some("shop"), &o));
+    }
+
+    #[test]
+    fn the_source_cache_holds_64_files_and_32_mb() {
+        let mut s = Sources::default();
+        for i in 0..64 {
+            s.insert(&i.to_string(), "fn main() {}");
+        }
+        assert_eq!(s.files.len(), 64);
+        s.insert("64", "fn main() {}");
+        assert_eq!(s.files.len(), 1, "the 65th file starts it over");
+
+        let mut s = Sources::default();
+        s.insert("big.rs", &"x".repeat((32 << 20) - 1));
+        s.insert("one.rs", "x");
+        assert_eq!((s.files.len(), s.bytes), (2, 32 << 20), "32 MB fit");
+        s.insert("two.rs", "x");
+        assert_eq!(
+            (s.files.len(), s.bytes),
+            (1, 1),
+            "a byte more starts it over"
+        );
+        assert!(s.files.contains_key("two.rs"));
     }
 
     #[cfg(unix)]

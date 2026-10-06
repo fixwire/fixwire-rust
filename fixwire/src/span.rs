@@ -554,7 +554,7 @@ mod tests {
         assert_eq!((span.tracestate(), span.baggage()), (None, None));
         let span = Span::continue_trace(
             parent,
-            Some("v=1"),
+            Some("v=1,\tw=2"),
             Some("plan=team,\tregion=eu"),
             "GET /",
             "http.server",
@@ -562,7 +562,8 @@ mod tests {
         );
         assert_eq!(
             (span.tracestate(), span.baggage()),
-            (Some("v=1"), Some("plan=team,\tregion=eu"))
+            (Some("v=1,\tw=2"), Some("plan=team,\tregion=eu")),
+            "a tab is list whitespace"
         );
         // At the limits they pass; a byte over, they are dropped whole.
         let sized = |n: usize| format!("k={}", "v".repeat(n - 2));
@@ -586,7 +587,9 @@ mod tests {
                 passed
             );
         }
-        for control in ["\u{0}", "\u{7f}", "\r", "\n", "\u{1b}"] {
+        for control in [
+            "\u{0}", "\u{8}", "\u{a}", "\u{b}", "\u{1f}", "\u{7f}", "\r", "\u{1b}",
+        ] {
             let header = format!("k=v{control}");
             let span = Span::continue_trace(
                 parent,

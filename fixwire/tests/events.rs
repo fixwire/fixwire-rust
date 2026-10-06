@@ -828,3 +828,77 @@ fn without_a_dsn_nothing_is_sent() {
     let value: Value = json!(null);
     assert!(value.is_null());
 }
+
+#[test]
+fn the_apps_configuration_is_cut_but_not_redacted() {
+    let ingest = Ingest::start();
+    let environment = format!("staging-{}", "e".repeat(40));
+    let client = Client::new(Options {
+        dsn: Some(ingest.dsn()),
+        release: Some("api@1.2.3.example".into()),
+        environment: Some(environment.clone()),
+        server_name: Some("ada@example.com".into()),
+        max_value_length: 32,
+        traces_sample_rate: 1.0,
+        auto_session_tracking: false,
+        ..Options::default()
+    })
+    .unwrap();
+    let hub = Hub::new(Some(Arc::new(client)), Scope::default());
+    let slug = format!("nightly-{}", "m".repeat(40));
+    let timezone = format!("Europe/{}", "z".repeat(40));
+    let url = format!("https://shop.example/{}", "p".repeat(40));
+    let source = format!("widget-{}", "s".repeat(40));
+    Hub::run(hub.clone(), || {
+        // The same text in the app's data is masked.
+        fixwire::capture_message("api@1.2.3.example", Level::Info);
+        fixwire::trace("mail ada@example.com", "task", |_| ());
+        fixwire::capture_feedback(Feedback {
+            message: Some("wrong".into()),
+            name: Some("ada@example.com".into()),
+            url: Some(url.clone()),
+            source: Some(source.clone()),
+            ..Feedback::default()
+        });
+        let config = MonitorConfig {
+            timezone: Some(timezone.clone()),
+            ..MonitorConfig::crontab("0 3 * * *")
+        };
+        fixwire::with_monitor(&slug, Some(config), || Ok::<_, std::io::Error>(()))
+    })
+    .unwrap();
+    flush(&hub);
+    // Cut to 32 bytes: 29 and "...".
+    let cut = |s: &str| format!("{}...", &s[..29]);
+
+    let logs = ingest.on("/v1/logs");
+    assert_eq!(
+        ingest.records()[0]["body"]["stringValue"],
+        "[REDACTED:email]"
+    );
+    let resource = attrs(&logs[0].body["resourceLogs"][0]["resource"]);
+    assert_eq!(resource["service.version"], "api@1.2.3.example");
+    assert_eq!(resource["service.name"], "api");
+    assert_eq!(resource["host.name"], "ada@example.com");
+    assert_eq!(resource["deployment.environment.name"], cut(&environment));
+    assert_eq!(ingest.spans()[0]["name"], "mail [REDACTED:email]");
+
+    let f = &ingest.on("/v1/feedback")[0].body;
+    assert_eq!(
+        (&f["release"], &f["environment"]),
+        (&json!("api@1.2.3.example"), &json!(cut(&environment)))
+    );
+    assert_eq!(f["name"], "[REDACTED:email]");
+    assert_eq!(
+        (&f["url"], &f["source"]),
+        (&json!(cut(&url)), &json!(cut(&source)))
+    );
+
+    let check_ins = ingest.on(&format!("/v1/check-ins/{}", cut(&slug)));
+    assert_eq!(check_ins.len(), 2, "the slug, cut");
+    assert_eq!(check_ins[0].body["environment"], cut(&environment));
+    assert_eq!(
+        check_ins[0].body["monitor_config"]["timezone"],
+        cut(&timezone)
+    );
+}

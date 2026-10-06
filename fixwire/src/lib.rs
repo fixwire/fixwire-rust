@@ -88,22 +88,11 @@ pub(crate) fn sdk() -> Value {
 /// Sets the SDK up: the process's hub gets a client for `opts`, and panics
 /// are reported. Keep the guard while the program runs: dropping it sends
 /// what is left (up to two seconds) and stops the SDK. Without a DSN the SDK
-/// stays off, and so does it with an invalid one (which it says on stderr).
+/// stays off, and so does it with an invalid one, given or in `FIXWIRE_DSN`
+/// (which it says on stderr): `init` doesn't panic.
 #[must_use = "dropping the guard stops the SDK: keep it until the program ends"]
 pub fn init(opts: Options) -> ClientInitGuard {
-    let client = match Client::new(opts) {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            eprintln!("{e}");
-            Arc::new(
-                Client::new(Options {
-                    dsn: None,
-                    ..Options::default()
-                })
-                .expect("no DSN is valid"),
-            )
-        }
-    };
+    let client = Arc::new(Client::new_or_off(opts));
     if client.is_enabled() && client.options().capture_panics {
         panic::install();
     }

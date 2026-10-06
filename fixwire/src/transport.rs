@@ -59,8 +59,9 @@ impl Request {
     }
 }
 
-/// The sends of one request (3 retries), and the longest a request waits for
-/// its next try: one due later is dropped.
+/// The sends of one request in all (after no answer, a `5xx` or a `429`'s
+/// pause), and the longest a request waits for its next try: one due later
+/// is dropped.
 const MAX_ATTEMPTS: u32 = 4;
 const MAX_WAIT: Duration = Duration::from_secs(300);
 /// The longest pause an answer may ask for (a day): a longer one would
@@ -551,9 +552,17 @@ mod tests {
     use super::*;
 
     fn worker(max_delayed: usize) -> Worker {
+        worker_to("http://k@127.0.0.1:9", max_delayed)
+    }
+
+    fn worker_to(dsn: &str, max_delayed: usize) -> Worker {
         Worker {
-            dsn: "http://k@127.0.0.1:9".parse().unwrap(),
-            agent: ureq::Agent::new_with_defaults(),
+            dsn: dsn.parse().unwrap(),
+            // As `Transport::new` sets it up: a 429 or a 5xx is an answer.
+            agent: ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .build()
+                .into(),
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
                     pending: 0,
@@ -642,6 +651,69 @@ mod tests {
         }
         w.retry(request, "503".into(), None);
         assert!(w.delayed.is_empty(), "no fourth retry");
+        assert_eq!(lock(&w.shared.state).pending, 0, "dropped");
+    }
+
+    /// A server answering each request with the next of `statuses`; the
+    /// number of requests it got.
+    fn answering(statuses: &'static [u16]) -> (String, Arc<Mutex<usize>>) {
+        use std::io::{BufRead, BufReader, Read};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dsn = format!("http://k@{}", listener.local_addr().unwrap());
+        let got = Arc::new(Mutex::new(0));
+        let count = Arc::clone(&got);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                loop {
+                    // The request line, the headers up to an empty line, the body.
+                    let mut length = 0;
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    loop {
+                        let mut h = String::new();
+                        if reader.read_line(&mut h).unwrap_or(0) == 0 || h.trim_end().is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = h.split_once(':')
+                            && k.eq_ignore_ascii_case("content-length")
+                        {
+                            length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let _ = reader.by_ref().take(length).read_to_end(&mut Vec::new());
+                    let n = {
+                        let mut got = lock(&count);
+                        *got += 1;
+                        *got
+                    };
+                    let status = statuses.get(n - 1).copied().unwrap_or(200);
+                    let answer = format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\n\r\n");
+                    if writer.write_all(answer.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        (dsn, got)
+    }
+
+    #[test]
+    fn a_request_is_sent_at_most_four_times_429s_included() {
+        let (dsn, got) = answering(&[429, 503, 429, 503]);
+        let mut w = worker_to(&dsn, 10);
+        lock(&w.shared.state).pending += 1;
+        w.deliver(Request::json("/v1/logs", Category::Error, Vec::new()));
+        assert!(!lock(&w.shared.state).until.is_empty(), "the 429 pauses");
+        while let Some(Reverse((_, _, DelayedRequest(r)))) = w.delayed.pop() {
+            // While a 429's pause lasts the request waits again, unsent; then the pause ends.
+            w.deliver(r);
+            lock(&w.shared.state).until.clear();
+        }
+        assert_eq!(*lock(&got), 4, "the fourth send is the last");
         assert_eq!(lock(&w.shared.state).pending, 0, "dropped");
     }
 
