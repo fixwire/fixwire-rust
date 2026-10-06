@@ -28,7 +28,6 @@ struct Bucket {
     tokens: f64,
     updated: Instant,
     suppressed: u64,
-    seen: Instant,
 }
 
 impl Bucket {
@@ -37,7 +36,6 @@ impl Bucket {
             tokens,
             updated: now,
             suppressed: 0,
-            seen: now,
         }
     }
 
@@ -55,9 +53,91 @@ impl Bucket {
     }
 }
 
+/// No slot: the end of the list.
+const NONE: usize = usize::MAX;
+
+/// An issue's bucket, linked by index to the issues seen just before and
+/// after it.
+struct Slot {
+    issue: u64,
+    bucket: Bucket,
+    newer: usize,
+    older: usize,
+}
+
+/// The issues remembered, in the order they were last seen: a lookup, a
+/// move to the front and forgetting the least recently seen take constant
+/// time.
+struct Issues {
+    slots: Vec<Slot>,
+    index: HashMap<u64, usize>,
+    newest: usize,
+    oldest: usize,
+}
+
+impl Issues {
+    fn new() -> Issues {
+        Issues {
+            slots: Vec::new(),
+            index: HashMap::new(),
+            newest: NONE,
+            oldest: NONE,
+        }
+    }
+
+    /// The issue's bucket, now the most recently seen; a new issue past
+    /// `MAX_ISSUES` takes the least recently seen one's slot.
+    fn seen(&mut self, issue: u64, new: Bucket) -> &mut Bucket {
+        let at = if let Some(&at) = self.index.get(&issue) {
+            self.unlink(at);
+            at
+        } else if self.slots.len() < MAX_ISSUES {
+            self.slots.push(Slot {
+                issue,
+                bucket: new,
+                newer: NONE,
+                older: NONE,
+            });
+            self.index.insert(issue, self.slots.len() - 1);
+            self.slots.len() - 1
+        } else {
+            let at = self.oldest;
+            self.unlink(at);
+            let slot = &mut self.slots[at];
+            self.index.remove(&slot.issue);
+            slot.issue = issue;
+            slot.bucket = new;
+            self.index.insert(issue, at);
+            at
+        };
+        self.slots[at].older = self.newest;
+        match self.newest {
+            NONE => self.oldest = at,
+            newest => self.slots[newest].newer = at,
+        }
+        self.newest = at;
+        &mut self.slots[at].bucket
+    }
+
+    /// Takes the slot out of the list.
+    fn unlink(&mut self, at: usize) {
+        let Slot { newer, older, .. } = self.slots[at];
+        match newer {
+            NONE => self.newest = older,
+            newer => self.slots[newer].older = older,
+        }
+        match older {
+            NONE => self.oldest = newer,
+            older => self.slots[older].newer = newer,
+        }
+        self.slots[at].newer = NONE;
+        self.slots[at].older = NONE;
+    }
+}
+
 pub(crate) struct Budget {
     opts: ErrorBudget,
-    state: Mutex<(HashMap<u64, Bucket>, Bucket)>,
+    state: Mutex<(Issues, Bucket)>,
 }
 
 impl Budget {
@@ -83,7 +163,7 @@ impl Budget {
         let all = Bucket::full(opts.per_minute, Instant::now());
         Budget {
             opts,
-            state: Mutex::new((HashMap::new(), all)),
+            state: Mutex::new((Issues::new(), all)),
         }
     }
 
@@ -96,16 +176,7 @@ impl Budget {
         let burst = f64::from(self.opts.per_issue_burst);
         let mut guard = lock(&self.state);
         let (issues, all) = &mut *guard;
-        if !issues.contains_key(&issue)
-            && issues.len() >= MAX_ISSUES
-            && let Some(oldest) = issues.iter().min_by_key(|(_, b)| b.seen).map(|(k, _)| *k)
-        {
-            issues.remove(&oldest);
-        }
-        let bucket = issues
-            .entry(issue)
-            .or_insert_with(|| Bucket::full(burst, now));
-        bucket.seen = now;
+        let bucket = issues.seen(issue, Bucket::full(burst, now));
         if bucket.take(burst, self.opts.per_issue_per_minute, now)
             && all.take(self.opts.per_minute, self.opts.per_minute, now)
         {
@@ -194,6 +265,75 @@ mod tests {
         // A minute later one more goes, carrying the 40 held back.
         assert_eq!(b.allow(1, t0 + Duration::from_secs(61)), Some(40));
         assert_eq!(b.allow(2, t0), Some(0), "another issue has its own budget");
+    }
+
+    #[test]
+    fn the_least_recently_seen_issue_is_forgotten_first() {
+        // One event an issue: a remembered issue holds the next back, a
+        // forgotten one starts afresh.
+        let b = Budget::new(ErrorBudget {
+            per_issue_burst: 1,
+            per_minute: 1e9,
+            ..ErrorBudget::default()
+        });
+        let t0 = Instant::now();
+        let mut tick = 0;
+        let mut allow = |issue: u64| {
+            tick += 1;
+            b.allow(issue, t0 + Duration::from_micros(tick))
+        };
+        let max = MAX_ISSUES as u64;
+        for issue in 0..max {
+            assert_eq!(allow(issue), Some(0));
+        }
+        for issue in 0..max {
+            assert_eq!(allow(issue), None, "issue {issue} remembered");
+        }
+        // Seen again, 0 leaves 1 the least recently seen: the 1,025th issue
+        // forgets it, and only it.
+        assert_eq!(allow(0), None);
+        assert_eq!(allow(max), Some(0));
+        for issue in (0..=max).filter(|&i| i != 1) {
+            assert_eq!(allow(issue), None, "issue {issue} remembered");
+        }
+        assert_eq!(allow(1), Some(0), "forgotten: a fresh budget");
+        // That forgot 0, the least recently seen since; 0 forgets 2.
+        assert_eq!(allow(0), Some(0));
+        assert_eq!(allow(2), Some(0));
+        assert_eq!(allow(max), None);
+    }
+
+    #[test]
+    fn new_issues_take_constant_time() {
+        // Past the issues remembered, each new one forgets the least
+        // recently seen without a scan.
+        let time = |issues: u64| {
+            let b = Budget::new(ErrorBudget::default());
+            let now = Instant::now();
+            let start = Instant::now();
+            for issue in 0..issues {
+                b.allow(issue, now);
+            }
+            start.elapsed()
+        };
+        // The best of runs taken in turn, at least 5 and up to 20 for a quiet
+        // moment: a busy machine slows both alike.
+        let (mut once, mut twice) = (Duration::MAX, Duration::MAX);
+        for round in 1..=20 {
+            if round > 5 && twice < once * 3 {
+                break;
+            }
+            once = once.min(time(100_000));
+            twice = twice.min(time(200_000));
+        }
+        assert!(
+            once < Duration::from_millis(500),
+            "100,000 issues took {once:?}"
+        );
+        assert!(
+            twice < once * 3,
+            "200,000 issues took {twice:?}, 100,000 {once:?}"
+        );
     }
 
     #[test]

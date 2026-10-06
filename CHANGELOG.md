@@ -4,6 +4,10 @@ All notable changes to the Fixwire SDK for Rust are listed here. Versions follow
 Versioning](https://semver.org); before 1.0, a minor version may change the
 API.
 
+## [Unreleased]
+
+- The error budget forgets the least recently seen of its 1024 issues in constant time: a new issue no longer scans them all.
+
 ## [0.1.1] - 2026-10-06
 
 - `init` no longer panics on an invalid `FIXWIRE_DSN`: an invalid DSN, given or in `FIXWIRE_DSN`, is said on stderr and leaves the SDK off (a valid `FIXWIRE_DSN` no longer stands in for an invalid `dsn`).
