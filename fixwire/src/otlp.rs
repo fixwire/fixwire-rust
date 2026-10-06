@@ -1,5 +1,5 @@
 //! OTLP JSON: errors and messages as log records, spans, and the resource
-//! that names the app (`sdks/PROTOCOL.md` §3, §4).
+//! that names the app (`fixwire-protocol` §3, §4).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -110,7 +110,7 @@ impl Client {
         (head, "]}]}]}")
     }
 
-    /// An error or a message as a log record (`sdks/PROTOCOL.md` §4),
+    /// An error or a message as a log record (`fixwire-protocol` §4),
     /// redacted, the values the app gave bounded and every string cut to
     /// `max_value_length`.
     pub(crate) fn event_record(&self, e: &Event) -> Value {

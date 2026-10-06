@@ -1,5 +1,5 @@
 //! Tracing: spans in W3C trace context, kept or not by the shared sampling
-//! rule, sent as OTLP (`sdks/PROTOCOL.md` §3, §9).
+//! rule, sent as OTLP (`fixwire-protocol` §3, §9).
 
 use std::fmt;
 use std::future::Future;

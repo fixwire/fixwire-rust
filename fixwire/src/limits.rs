@@ -1,5 +1,5 @@
 //! The bounds on what is sent, the same in every Fixwire SDK
-//! (`sdks/PROTOCOL.md` §13): strings cut on a character boundary, and the
+//! (`fixwire-protocol` §13): strings cut on a character boundary, and the
 //! values the app gives bounded in depth, breadth and size.
 
 use std::borrow::Cow;

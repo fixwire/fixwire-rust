@@ -19,7 +19,7 @@ use crate::sessions::Aggregates;
 use crate::transport::{Category, Request, Transport};
 use crate::types::{Event, Level};
 
-/// The most an error or a message may weigh (`sdks/PROTOCOL.md` §4).
+/// The most an error or a message may weigh (`fixwire-protocol` §4).
 const MAX_EVENT_BYTES: usize = 1 << 20;
 
 /// Sends to one project. Most programs use the one `init` sets up, through
