@@ -1,6 +1,6 @@
 [package]
 name = "fixwire"
-version = "0.1.1"
+version = "0.1.2"
 description = "Fixwire SDK for Rust: errors, panics, traces, release health, cron monitors and feedback"
 keywords = ["fixwire", "errors", "panic", "tracing", "monitoring"]
 categories = ["development-tools::debugging"]

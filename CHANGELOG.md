@@ -4,7 +4,7 @@ All notable changes to the Fixwire SDK for Rust are listed here. Versions follow
 Versioning](https://semver.org); before 1.0, a minor version may change the
 API.
 
-## [Unreleased]
+## [0.1.2] - 2026-10-07
 
 - The error budget forgets the least recently seen of its 1024 issues in constant time: a new issue no longer scans them all.
 
