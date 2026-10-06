@@ -4,11 +4,8 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::Command;
-#[cfg(unix)]
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
@@ -185,8 +182,12 @@ fn plain(v: &Value) -> Value {
 }
 
 /// The examples stop on SIGTERM, as containers stop apps: there is no SIGTERM to send on Windows.
-#[cfg(unix)]
+/// It compiles everywhere all the same, so a check on any machine catches what Windows would.
 #[test]
+#[cfg_attr(
+    not(unix),
+    ignore = "stops the example with SIGTERM, which Windows lacks"
+)]
 fn shop_api() {
     let ingest = ingest();
     // The inventory holds sku_1; sku_2 is sold out.
