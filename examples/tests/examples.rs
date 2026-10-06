@@ -181,18 +181,40 @@ fn plain(v: &Value) -> Value {
     Value::Null
 }
 
-/// The examples stop on SIGTERM, as containers stop apps: there is no SIGTERM to send on Windows.
-/// It compiles everywhere all the same, so a check on any machine catches what Windows would.
+/// Starts an example as one the system can stop: on Windows, in a process group of its own, so
+/// Ctrl-Break reaches it alone.
+fn stoppable(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+    command
+}
+
+/// Stops an example as the system stops a program: SIGTERM, or Ctrl-Break on Windows.
+fn stop(app: &std::process::Child) {
+    #[cfg(unix)]
+    let sent = Command::new("kill")
+        .args(["-TERM", &app.id().to_string()])
+        .status()
+        .is_ok_and(|s| s.success());
+    #[cfg(windows)]
+    // SAFETY: a plain call with two integers; the process group is the example's own.
+    let sent = unsafe {
+        use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+        GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, app.id()) != 0
+    };
+    assert!(sent, "the example was told to stop");
+}
+
 #[test]
-#[cfg_attr(
-    not(unix),
-    ignore = "stops the example with SIGTERM, which Windows lacks"
-)]
 fn shop_api() {
     let ingest = ingest();
     // The inventory holds sku_1; sku_2 is sold out.
     let inventory = Recorder::start(|path| if path.contains("sku_2") { 409 } else { 200 });
-    let mut app = Command::new(env!("CARGO_BIN_EXE_shop-api"))
+    let mut app = stoppable(&mut Command::new(env!("CARGO_BIN_EXE_shop-api")))
         .env("FIXWIRE_DSN", dsn(&ingest))
         .env(
             "INVENTORY_URL",
@@ -258,10 +280,7 @@ fn shop_api() {
     ] {
         assert_eq!(call(method, path, user, body), want, "{method} {path}");
     }
-    Command::new("kill")
-        .args(["-TERM", &app.id().to_string()])
-        .status()
-        .unwrap();
+    stop(&app);
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         if let Some(s) = app.try_wait().unwrap() {

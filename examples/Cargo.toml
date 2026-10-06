@@ -31,3 +31,7 @@ tracing-subscriber = { version = "0.3.23", features = ["fmt"] }
 [dev-dependencies]
 flate2 = "1.1.10"
 ureq = "3.4.2"
+
+# The test stops the API with Ctrl-Break on Windows, as Windows stops a console program.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }

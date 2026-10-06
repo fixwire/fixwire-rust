@@ -114,7 +114,8 @@ async fn main() {
         "listening on {}",
         listener.local_addr().expect("an address").port()
     );
-    // On SIGTERM (or Ctrl-C): finish the requests under way; then the guard sends what is left.
+    // When stopped (SIGTERM, Ctrl-C, or Ctrl-Break on Windows): finish the requests under way; then
+    // the guard sends what is left.
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown())
         .await
@@ -240,18 +241,26 @@ async fn shutdown() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
+    // How the system stops a program: SIGTERM (containers, service managers), or Ctrl-Break on
+    // Windows, where a console program gets no signals.
     #[cfg(unix)]
-    let term = async {
+    let stop = async {
         if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         {
             s.recv().await;
         }
     };
-    #[cfg(not(unix))]
-    let term = std::future::pending::<()>();
+    #[cfg(windows)]
+    let stop = async {
+        if let Ok(mut s) = tokio::signal::windows::ctrl_break() {
+            s.recv().await;
+        }
+    };
+    #[cfg(not(any(unix, windows)))]
+    let stop = std::future::pending::<()>();
     tokio::select! {
         () = ctrl_c => {},
-        () = term => {},
+        () = stop => {},
     }
 }
 
