@@ -131,7 +131,7 @@ fn is_sdk(function: &str) -> bool {
 /// their index (`{closure#1}`, or `{{closure}}` in legacy symbols, is
 /// `{closure}`): it moves when another closure is written before them.
 pub(crate) fn split_function(name: &str) -> (Option<String>, String) {
-    let name = without_generics(&without_indexes(name));
+    let name = without_generics(&without_indexes(&without_msvc_wrappers(name)));
     let (mut depth, mut split) = (0usize, None);
     let bytes = name.as_bytes();
     for i in 0..bytes.len() {
@@ -146,6 +146,44 @@ pub(crate) fn split_function(name: &str) -> (Option<String>, String) {
         Some(i) if i > 0 => (Some(name[..i].to_owned()), name[i + 2..].to_owned()),
         _ => (None, name),
     }
+}
+
+/// Types as Windows' debug information writes them, unwrapped: `enum2$<T>` is `T`,
+/// `ref$<T>` is `&T`, `slice2$<T>` is `[T]`, … So a frame there names what it
+/// names elsewhere: `enum2$<core::result::Result<T,E> >::unwrap` is
+/// `core::result::Result<T,E>::unwrap`.
+fn without_msvc_wrappers(name: &str) -> String {
+    const WRAPPERS: [(&str, &str, &str); 6] = [
+        ("enum2$<", "", ""),
+        ("ref$<", "&", ""),
+        ("ref_mut$<", "&mut ", ""),
+        ("slice2$<", "[", "]"),
+        ("ptr_const$<", "*const ", ""),
+        ("ptr_mut$<", "*mut ", ""),
+    ];
+    let mut name = name.to_owned();
+    while let Some((at, (open, before, after))) = WRAPPERS
+        .iter()
+        .filter_map(|w| name.find(w.0).map(|at| (at, w)))
+        .min_by_key(|(at, _)| *at)
+    {
+        let start = at + open.len();
+        let mut depth = 1usize;
+        let Some(end) = name[start..].bytes().position(|b| {
+            match b {
+                b'<' => depth += 1,
+                b'>' => depth -= 1,
+                _ => {}
+            }
+            depth == 0
+        }) else {
+            break; // unbalanced: leave it
+        };
+        let end = start + end;
+        let inner = name[start..end].trim_end();
+        name = format!("{}{before}{inner}{after}{}", &name[..at], &name[end + 1..]);
+    }
+    name
 }
 
 /// A name without the generic arguments of its functions: `catch_unwind::<…>`
@@ -372,6 +410,14 @@ mod tests {
             ),
             ("index<&str, usize>", (None, "index")),
             // Windows (MSVC debug information)
+            (
+                "enum2$<core::result::Result<u32,core::num::error::ParseIntError> >::unwrap<u32,core::num::error::ParseIntError>",
+                (Some("core::result::Result"), "unwrap"),
+            ),
+            (
+                "core::ptr::drop_in_place<ref$<slice2$<u8> > >",
+                (Some("core::ptr"), "drop_in_place"),
+            ),
             (
                 "events::errors_go::closure$0",
                 (Some("events::errors_go"), "{closure}"),
