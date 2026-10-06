@@ -83,6 +83,8 @@ struct SpanState {
 
 /// Bounds the spans a segment keeps until it is sent.
 const MAX_CHILDREN: usize = 1000;
+/// The longest `tracestate` or `baggage` passed on (W3C baggage's limit).
+const MAX_PROPAGATED: usize = 8192;
 
 impl Span {
     fn build(
@@ -139,7 +141,8 @@ impl Span {
 
     /// A span continuing a caller's trace, from its W3C `traceparent`,
     /// `tracestate` and `baggage` headers; a new trace when `traceparent`
-    /// is missing or malformed.
+    /// is missing or malformed. A `tracestate` or `baggage` longer than 8 KB,
+    /// or with control characters, is not passed on.
     pub fn continue_trace(
         traceparent: Option<&str>,
         tracestate: Option<&str>,
@@ -153,7 +156,7 @@ impl Span {
                 name.into(),
                 op,
                 (trace, Some(parent), sampled, true),
-                (tracestate.map(str::to_owned), baggage.map(str::to_owned)),
+                (propagated(tracestate), propagated(baggage)),
                 None,
                 client,
             ),
@@ -341,6 +344,17 @@ pub(crate) fn sample_trace(trace_id: &str, rate: f64) -> bool {
     }
 }
 
+/// A caller's `tracestate` or `baggage` to pass on: every span of the trace
+/// holds it and every request it makes carries it, so a huge one, or one that
+/// would break a header (CR, LF), stays out.
+fn propagated(header: Option<&str>) -> Option<String> {
+    header
+        .filter(|h| {
+            h.len() <= MAX_PROPAGATED && !h.bytes().any(|b| b.is_ascii_control() && b != b'\t')
+        })
+        .map(str::to_owned)
+}
+
 /// Reads `00-<trace id>-<parent id>-<flags>`: the trace, the parent and
 /// whether the trace is sampled.
 pub(crate) fn parse_traceparent(h: &str) -> Option<(String, String, bool)> {
@@ -475,5 +489,32 @@ mod tests {
         assert_eq!(child.inner.parent_span_id.as_deref(), Some(root.span_id()));
         assert_eq!(child.inner.kind, SpanKind::Client);
         assert!(child.traceparent().ends_with("-01"));
+    }
+
+    #[test]
+    fn passes_on_only_sane_trace_headers() {
+        let parent = Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+        let huge = "k=v,".repeat(3000);
+        let span = Span::continue_trace(
+            parent,
+            Some("v=1\r\nX-Injected: 1"),
+            Some(&huge),
+            "GET /",
+            "http.server",
+            None,
+        );
+        assert_eq!((span.tracestate(), span.baggage()), (None, None));
+        let span = Span::continue_trace(
+            parent,
+            Some("v=1"),
+            Some("plan=team,\tregion=eu"),
+            "GET /",
+            "http.server",
+            None,
+        );
+        assert_eq!(
+            (span.tracestate(), span.baggage()),
+            (Some("v=1"), Some("plan=team,\tregion=eu"))
+        );
     }
 }

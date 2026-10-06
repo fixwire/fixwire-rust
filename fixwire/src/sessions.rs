@@ -91,6 +91,11 @@ pub(crate) fn device_id(user: Option<&User>) -> String {
         .collect()
 }
 
+/// The (minute, user) counts kept between sends; past them, users are
+/// counted without their id, so memory and the body (at most 1 MB) stay
+/// small however many users come.
+const MAX_BUCKETS: usize = 5000;
+
 #[derive(Default)]
 struct Counts {
     exited: u64,
@@ -140,7 +145,11 @@ impl Aggregates {
     fn record(&self, status: Status, did: String, at: SystemTime) {
         let minute = at.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() / 60 * 60;
         let mut buckets = lock(&self.buckets);
-        let counts = buckets.entry((minute, did)).or_default();
+        let mut key = (minute, did);
+        if buckets.len() >= MAX_BUCKETS && !buckets.contains_key(&key) {
+            key.1 = String::new();
+        }
+        let counts = buckets.entry(key).or_default();
         match status {
             Status::Ok => counts.exited += 1,
             Status::Errored => counts.errored += 1,
@@ -219,5 +228,32 @@ mod tests {
         assert_eq!(device_id(Some(&u)).len(), 32);
         assert_ne!(device_id(Some(&u)), "user-1");
         assert_eq!(device_id(None), "");
+    }
+
+    #[test]
+    fn many_users_are_counted_in_bounded_memory() {
+        let transport = Arc::new(Transport::new(
+            "http://k@127.0.0.1:9".parse().unwrap(),
+            &crate::options::Options::default(),
+        ));
+        let a = Aggregates::start(
+            transport,
+            "shop@1.0.0".into(),
+            "production".into(),
+            Duration::from_secs(3600),
+        );
+        let at = UNIX_EPOCH + Duration::from_secs(1_791_190_800);
+        for i in 0..MAX_BUCKETS + 100 {
+            let user = User::with_id(i.to_string());
+            a.record(Status::Ok, device_id(Some(&user)), at);
+        }
+        a.stop();
+        let buckets = lock(&a.buckets);
+        assert_eq!(buckets.len(), MAX_BUCKETS + 1);
+        assert_eq!(
+            buckets[&(1_791_190_800, String::new())].exited,
+            100,
+            "the rest counted without their id"
+        );
     }
 }

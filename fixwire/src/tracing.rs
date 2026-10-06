@@ -78,12 +78,20 @@ impl<S: ::tracing::Subscriber> tracing_subscriber::Layer<S> for FixwireLayer {
         if level < self.breadcrumb_level && level < self.event_level {
             return;
         }
-        let mut fields = Fields::default();
-        event.record(&mut fields);
+        // What libraries log on the SDK's threads (its HTTP client, TLS) is the SDK's, not the
+        // app's: sending it would only make more of it.
+        if matches!(
+            std::thread::current().name(),
+            Some("fixwire-transport" | "fixwire-sessions")
+        ) {
+            return;
+        }
         let hub = Hub::current();
         let Some(client) = hub.client().filter(|c| c.is_enabled()) else {
             return;
         };
+        let mut fields = Fields::default();
+        event.record(&mut fields);
         if level >= self.event_level {
             let mut e = Event {
                 level: Some(level),

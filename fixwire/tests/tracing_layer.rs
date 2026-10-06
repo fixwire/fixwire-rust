@@ -85,3 +85,52 @@ fn events_become_breadcrumbs_and_errors_events() {
         "the mail server said no to [REDACTED:email]"
     );
 }
+
+#[test]
+fn the_sdks_threads_and_scope_changes_are_left_alone() {
+    let ingest = Ingest::start();
+    let client = Arc::new(
+        Client::new(Options {
+            dsn: Some(ingest.dsn()),
+            ..Options::default()
+        })
+        .unwrap(),
+    );
+    let hub = Hub::new(Some(Arc::clone(&client)), Scope::default());
+    let subscriber = || tracing_subscriber::registry().with(fixwire::tracing::layer());
+
+    // What a library logs on the SDK's sending thread (its TLS, say) isn't the app's.
+    let h = hub.clone();
+    std::thread::Builder::new()
+        .name("fixwire-transport".into())
+        .spawn(move || {
+            tracing::subscriber::with_default(subscriber(), || {
+                Hub::run(h, || tracing::error!("Sending fatal alert BadCertificate"))
+            })
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+
+    // A log while the scope changes doesn't wait for the lock the thread holds.
+    let (done, finished) = std::sync::mpsc::channel();
+    let h = hub.clone();
+    std::thread::spawn(move || {
+        tracing::subscriber::with_default(subscriber(), || {
+            Hub::run(h, || {
+                fixwire::configure_scope(|s| {
+                    tracing::info!("loading the user");
+                    tracing::error!("the user's plan is gone");
+                    s.set_tag("plan", "team");
+                })
+            })
+        });
+        let _ = done.send(());
+    });
+    assert!(finished.recv_timeout(Duration::from_secs(10)).is_ok());
+    assert!(client.flush(Duration::from_secs(5)));
+
+    let records = ingest.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["body"]["stringValue"], "the user's plan is gone");
+}

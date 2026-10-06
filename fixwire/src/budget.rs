@@ -19,6 +19,9 @@ use crate::types::Event;
 /// frames that name one.
 const MAX_ISSUES: usize = 1024;
 const TOP_FRAMES: usize = 5;
+/// The bytes of a message read for its fingerprint: finding every match can
+/// take time quadratic in the text, and the start tells issues apart.
+const MAX_MESSAGE: usize = 1024;
 
 #[derive(Clone, Copy)]
 struct Bucket {
@@ -144,12 +147,16 @@ pub(crate) fn issue_of(e: &Event) -> u64 {
                     .map(|f| format!("{}|{}", f.module.as_deref().unwrap_or_default(), f.function)),
             );
             if outer.frames.is_empty() {
-                parts.push(VARIABLE.replace_all(&outer.message, "<*>").into_owned());
+                parts.push(
+                    VARIABLE
+                        .replace_all(head(&outer.message), "<*>")
+                        .into_owned(),
+                );
             }
         }
         None => parts.push(
             VARIABLE
-                .replace_all(e.message.as_deref().unwrap_or_default(), "<*>")
+                .replace_all(head(e.message.as_deref().unwrap_or_default()), "<*>")
                 .into_owned(),
         ),
     }
@@ -157,6 +164,15 @@ pub(crate) fn issue_of(e: &Event) -> u64 {
         parts.push(e.fingerprint.join("\x1f"));
     }
     fnv1a(parts.join("\x1e").as_bytes())
+}
+
+/// The first `MAX_MESSAGE` bytes of a message, cut on a character boundary.
+fn head(message: &str) -> &str {
+    let mut end = message.len().min(MAX_MESSAGE);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    &message[..end]
 }
 
 /// FNV-1a, 64 bits: cheap, and stable across runs (unlike `DefaultHasher`).
@@ -207,5 +223,24 @@ mod tests {
         };
         assert_ne!(issue_of(&err("ParseIntError")), issue_of(&err("Declined")));
         assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
+    }
+
+    #[test]
+    fn hostile_messages_take_linear_time() {
+        // Each match makes the regex scan to the end of the text: quadratic without a bound.
+        for message in ["1g".repeat(100_000), "1\u{e9}".repeat(70_000)] {
+            let start = Instant::now();
+            let id = issue_of(&Event {
+                message: Some(message.clone()),
+                ..Event::default()
+            });
+            assert!(start.elapsed() < Duration::from_secs(1));
+            let longer = Event {
+                message: Some(message + "tail"),
+                ..Event::default()
+            };
+            assert_eq!(issue_of(&longer), id, "the start names the issue");
+        }
+        assert_eq!(head("\u{e9}".repeat(600).as_str()).len(), 1024);
     }
 }

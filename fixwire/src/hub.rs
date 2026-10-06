@@ -2,12 +2,12 @@
 //! futures across the threads that poll them.
 
 use std::any::type_name;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, RwLock, TryLockError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -33,6 +33,9 @@ static PROCESS: LazyLock<Hub> = LazyLock::new(|| Hub::new(None, Scope::default()
 
 thread_local! {
     static THREAD: RefCell<Option<Hub>> = const { RefCell::new(None) };
+    /// Set while the thread runs code that changes a scope: what that code
+    /// captures (a panic in it, a log) doesn't wait for the lock it holds.
+    static CONFIGURING: Cell<usize> = const { Cell::new(0) };
 }
 
 /// A lock that a panic while it was held doesn't spoil: the SDK must keep
@@ -54,8 +57,11 @@ impl Hub {
 
     /// The current hub: the thread's, else the process's.
     pub fn current() -> Hub {
+        // Gone while the thread ends: a destructor logging then gets the process's.
         THREAD
-            .with(|t| t.borrow().clone())
+            .try_with(|t| t.borrow().clone())
+            .ok()
+            .flatten()
             .unwrap_or_else(Hub::main)
     }
 
@@ -104,8 +110,32 @@ impl Hub {
 
     /// Changes the current scope.
     pub fn configure_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> R {
+        struct Configuring;
+        impl Drop for Configuring {
+            fn drop(&mut self) {
+                CONFIGURING.with(|c| c.set(c.get() - 1));
+            }
+        }
         let mut scopes = lock(&self.inner.scopes);
+        CONFIGURING.with(|c| c.set(c.get() + 1));
+        let _configuring = Configuring;
         f(scopes.last_mut().expect("a hub always has a scope"))
+    }
+
+    /// The current scope for the SDK's own use: `None` when the thread is
+    /// changing a scope and this one is locked (by that thread, perhaps), so
+    /// the SDK never waits for a lock its own thread holds.
+    fn try_configure_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> Option<R> {
+        let mut scopes = if CONFIGURING.with(Cell::get) > 0 {
+            match self.inner.scopes.try_lock() {
+                Ok(scopes) => scopes,
+                Err(TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(TryLockError::WouldBlock) => return None,
+            }
+        } else {
+            lock(&self.inner.scopes)
+        };
+        scopes.last_mut().map(f)
     }
 
     /// Runs `f` with a copy of the current scope, set up by `configure`:
@@ -120,12 +150,10 @@ impl Hub {
                 }
             }
         }
-        {
-            let mut scopes = lock(&self.inner.scopes);
-            let mut scope = scopes.last().cloned().unwrap_or_default();
-            configure(&mut scope);
-            scopes.push(scope);
-        }
+        // `configure` runs without the lock: a panic in it is reported with the scope.
+        let mut scope = lock(&self.inner.scopes).last().cloned().unwrap_or_default();
+        configure(&mut scope);
+        lock(&self.inner.scopes).push(scope);
         let _pop = Pop(self);
         f()
     }
@@ -133,7 +161,8 @@ impl Hub {
     /// Sends an error, with the stack where it was captured and its chain of
     /// sources; its event id, or `None` when it was not sent.
     pub fn capture_error<E: Error + ?Sized>(&self, err: &E) -> Option<String> {
-        let client = self.client()?;
+        // No stack is taken for a client that sends nothing.
+        let client = self.client().filter(|c| c.is_enabled())?;
         let frames = stacktrace::capture(client.options());
         self.capture_event(Event {
             exceptions: exceptions_of(err, frames, Mechanism::default()),
@@ -156,20 +185,17 @@ impl Hub {
         if !client.is_enabled() {
             return None;
         }
-        {
-            let scopes = lock(&self.inner.scopes);
-            if let Some(scope) = scopes.last() {
-                scope.apply_to(&mut event);
-                // The session counts the error whether or not it is sent.
-                match event.exceptions.first() {
-                    Some(x) => scope.mark_session(!x.mechanism.handled),
-                    None if matches!(event.level, Some(Level::Error | Level::Fatal)) => {
-                        scope.mark_session(false)
-                    }
-                    None => {}
+        self.try_configure_scope(|scope| {
+            scope.apply_to(&mut event);
+            // The session counts the error whether or not it is sent.
+            match event.exceptions.first() {
+                Some(x) => scope.mark_session(!x.mechanism.handled),
+                None if matches!(event.level, Some(Level::Error | Level::Fatal)) => {
+                    scope.mark_session(false)
                 }
+                None => {}
             }
-        }
+        });
         client.capture(event)
     }
 
@@ -192,7 +218,7 @@ impl Hub {
             },
             None => breadcrumb,
         };
-        self.configure_scope(|s| s.add_breadcrumb(breadcrumb, max));
+        self.try_configure_scope(|s| s.add_breadcrumb(breadcrumb, max));
     }
 
     /// Waits until what was captured is sent, or `timeout`; false when time
@@ -378,5 +404,33 @@ mod tests {
             debug_type(&std::io::Error::from(std::io::ErrorKind::NotFound)),
             "Error"
         );
+    }
+
+    #[test]
+    fn what_runs_while_the_scope_changes_never_waits_for_it() {
+        let client = Client::new(crate::Options {
+            dsn: Some("http://k@127.0.0.1:9".into()),
+            ..crate::Options::default()
+        })
+        .unwrap();
+        let hub = Hub::new(Some(Arc::new(client)), Scope::default());
+        let (done, finished) = std::sync::mpsc::channel();
+        let h = hub.clone();
+        std::thread::spawn(move || {
+            // What a log or a panic in there would do, through the tracing layer or the hook.
+            let sent = h.configure_scope(|s| {
+                s.set_tag("plan", "team");
+                h.add_breadcrumb(Breadcrumb::new("user", "dropped: the scope is busy"));
+                h.capture_message("sent without the scope", Level::Error)
+            });
+            let _ = done.send(sent.is_some());
+        });
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "no deadlock"
+        );
+        hub.add_breadcrumb(Breadcrumb::new("user", "kept"));
+        assert_eq!(hub.configure_scope(|s| s.breadcrumbs.len()), 1);
     }
 }

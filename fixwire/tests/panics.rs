@@ -2,8 +2,8 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use common::{Ingest, attrs};
@@ -49,11 +49,34 @@ fn panics_are_crashes_and_the_previous_hook_still_runs() {
         previous_ran.load(Ordering::SeqCst),
         "the hook that was there ran too"
     );
+    // A panic while the scope is being changed: the hook doesn't wait for the scope's lock,
+    // which the panicking thread holds.
+    let (done, finished) = mpsc::channel();
+    let in_scope = hub.clone();
+    std::thread::spawn(move || {
+        let panicked = std::thread::spawn(move || {
+            Hub::run(in_scope.clone(), || {
+                in_scope.configure_scope(|s| s.set_tag("order", parse_order("").to_string()))
+            })
+        })
+        .join()
+        .is_err();
+        let _ = done.send(panicked);
+    });
+    assert_eq!(
+        finished.recv_timeout(Duration::from_secs(10)),
+        Ok(true),
+        "reported without a deadlock"
+    );
     assert!(Hub::main().flush(Duration::from_secs(5)));
 
     let records = ingest.records();
-    assert_eq!(records.len(), 2);
-    for r in &records {
+    assert_eq!(records.len(), 3);
+    let in_scope = attrs(&records[2]);
+    assert_eq!(in_scope["exception.message"], "invalid order: \"\"");
+    assert_eq!(in_scope["fixwire.handled"], json!(false));
+    let records = &records[..2];
+    for r in records {
         assert_eq!(r["severityNumber"], 21, "fatal");
         let a = attrs(r);
         assert_eq!(a["fixwire.handled"], json!(false));

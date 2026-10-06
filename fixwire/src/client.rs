@@ -15,6 +15,9 @@ use crate::sessions::Aggregates;
 use crate::transport::{Category, Request, Transport};
 use crate::types::{Event, Level};
 
+/// The most an error or a message may weigh (`sdks/PROTOCOL.md` §4).
+const MAX_EVENT_BYTES: usize = 1 << 20;
+
 /// Sends to one project. Most programs use the one `init` sets up, through
 /// the crate's functions or a `Hub`.
 pub struct Client {
@@ -96,7 +99,23 @@ impl Client {
             e = before(e)?;
         }
         let id = e.event_id.clone();
-        let body = serde_json::to_vec(&self.logs_export(self.event_record(&e))).ok()?;
+        let mut body = serde_json::to_vec(&self.logs_export(self.event_record(&e))).ok()?;
+        if body.len() > MAX_EVENT_BYTES {
+            // Fixwire refuses it: it goes without its breadcrumbs, details and source lines, or
+            // not at all.
+            e.breadcrumbs.clear();
+            e.extra.clear();
+            for f in e.exceptions.iter_mut().flat_map(|x| x.frames.iter_mut()) {
+                f.context_line = None;
+                f.pre_context.clear();
+                f.post_context.clear();
+            }
+            body = serde_json::to_vec(&self.logs_export(self.event_record(&e))).ok()?;
+            if body.len() > MAX_EVENT_BYTES {
+                self.log(|| "dropped an event: larger than 1 MB".into());
+                return None;
+            }
+        }
         transport
             .send(Request::json("/v1/logs", Category::Error, body))
             .then_some(id)
@@ -154,14 +173,15 @@ impl Client {
         self.transport.as_ref().is_none_or(|t| t.flush(timeout))
     }
 
-    /// Flushes and stops the client.
+    /// Flushes and stops the client, within `timeout`.
     pub fn close(&self, timeout: Duration) {
+        let start = Instant::now();
         if let Some(s) = &self.sessions {
             s.stop();
         }
         self.flush(timeout);
         if let Some(t) = &self.transport {
-            t.close();
+            t.close(timeout.saturating_sub(start.elapsed()));
         }
     }
 }

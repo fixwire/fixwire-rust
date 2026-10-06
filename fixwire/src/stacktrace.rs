@@ -3,6 +3,7 @@
 //! source lines around the app's.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 
@@ -362,10 +363,18 @@ fn add_context(f: &mut Frame, around: usize) {
         if sources.len() >= MAX_SOURCE_FILES {
             sources.clear();
         }
+        // Regular files only: opening a FIFO waits for a writer, and a device may never end.
         let lines = std::fs::metadata(path)
             .ok()
-            .filter(|m| m.len() <= MAX_SOURCE_BYTES)
-            .and_then(|_| std::fs::read_to_string(path).ok())
+            .filter(|m| m.is_file() && m.len() <= MAX_SOURCE_BYTES)
+            .and_then(|_| std::fs::File::open(path).ok())
+            .and_then(|file| {
+                let mut text = String::new();
+                file.take(MAX_SOURCE_BYTES)
+                    .read_to_string(&mut text)
+                    .ok()
+                    .map(|_| text)
+            })
             .map(|s| s.lines().map(str::to_owned).collect())
             .unwrap_or_default();
         sources.insert(path.to_owned(), lines);
@@ -512,5 +521,34 @@ mod tests {
             ..Options::default()
         };
         assert!(in_app(Some("serde::de"), None, root, Some("shop"), &o));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_lines_come_from_regular_files_only() {
+        let dir = std::env::temp_dir().join(format!("fixwire-fifo-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let fifo = dir.join("main.rs");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|s| s.success());
+        if made {
+            let path = fifo.to_string_lossy().into_owned();
+            let (done, finished) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut f = Frame {
+                    abs_path: Some(path),
+                    line: Some(1),
+                    ..Frame::default()
+                };
+                add_context(&mut f, 5);
+                let _ = done.send(f.context_line);
+            });
+            // Opening the FIFO would wait for a writer forever.
+            let got = finished.recv_timeout(std::time::Duration::from_secs(5));
+            assert_eq!(got, Ok(None));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

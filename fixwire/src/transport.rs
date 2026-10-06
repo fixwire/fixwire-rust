@@ -5,8 +5,9 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -62,6 +63,9 @@ impl Request {
 /// it is dropped.
 const MAX_ATTEMPTS: u32 = 4;
 const MAX_WAIT: Duration = Duration::from_secs(300);
+/// The longest pause an answer may ask for (a day): a longer one would
+/// overflow the clock.
+const MAX_PAUSE: u64 = 86_400;
 
 enum Message {
     Send(Request),
@@ -73,11 +77,16 @@ struct State {
     pending: usize,
     /// Paused until, per category (`None`: every category).
     until: HashMap<Option<Category>, Instant>,
+    /// The thread has ended.
+    stopped: bool,
 }
 
 struct Shared {
     state: Mutex<State>,
+    /// Signalled when nothing is pending, and when the thread ends.
     idle: Condvar,
+    /// Set by `close`: what is left is dropped, not sent.
+    stopping: AtomicBool,
     debug: bool,
 }
 
@@ -117,16 +126,21 @@ impl Transport {
             state: Mutex::new(State {
                 pending: 0,
                 until: HashMap::new(),
+                stopped: false,
             }),
             idle: Condvar::new(),
+            stopping: AtomicBool::new(false),
             debug: opts.debug,
         });
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(opts.timeout))
             .http_status_as_error(false)
+            // A redirect is an answer, not followed: the key and the data go to the DSN's host only.
+            .max_redirects(0)
             .user_agent(format!("{}/{}", crate::SDK_NAME, crate::SDK_VERSION))
             .build()
             .into();
+        let max_delayed = opts.max_queue;
         let worker = {
             let shared = Arc::clone(&shared);
             std::thread::Builder::new()
@@ -137,6 +151,7 @@ impl Transport {
                         agent,
                         shared,
                         delayed: BinaryHeap::new(),
+                        max_delayed,
                         seq: 0,
                     }
                     .run(receiver)
@@ -181,27 +196,39 @@ impl Transport {
             .shared
             .idle
             .wait_timeout_while(state, timeout, |s| s.pending > 0)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         drop(state);
         !result.timed_out()
     }
 
-    /// Stops the thread; what is still queued is dropped.
-    pub(crate) fn close(&self) {
+    /// Stops the thread; what is still queued is dropped. Waits up to
+    /// `timeout` for a request being sent, then leaves the thread to end on
+    /// its own.
+    pub(crate) fn close(&self, timeout: Duration) {
+        self.shared.stopping.store(true, Ordering::Relaxed);
         if let Some(sender) = lock(&self.sender).take() {
             let _ = sender.try_send(Message::Stop);
         }
         if let Some(worker) = lock(&self.worker).take()
             && worker.thread().id() != std::thread::current().id()
         {
-            let _ = worker.join();
+            let state = lock(&self.shared.state);
+            let (state, _) = self
+                .shared
+                .idle
+                .wait_timeout_while(state, timeout, |s| !s.stopped)
+                .unwrap_or_else(PoisonError::into_inner);
+            if state.stopped {
+                drop(state);
+                let _ = worker.join();
+            }
         }
     }
 }
 
 impl Drop for Transport {
     fn drop(&mut self) {
-        self.close();
+        self.close(Duration::ZERO);
     }
 }
 
@@ -211,6 +238,8 @@ struct Worker {
     shared: Arc<Shared>,
     /// Requests waiting to be retried, the soonest first.
     delayed: BinaryHeap<Reverse<(Instant, u64, DelayedRequest)>>,
+    /// Bounds `delayed`: the queue's size.
+    max_delayed: usize,
     seq: u64,
 }
 
@@ -274,9 +303,21 @@ impl Worker {
         while let Ok(Message::Send(_)) = receiver.try_recv() {
             self.shared.finish();
         }
+        lock(&self.shared.state).stopped = true;
+        self.shared.idle.notify_all();
     }
 
     fn later(&mut self, request: Request, wait: Duration) {
+        if self.delayed.len() >= self.max_delayed {
+            self.shared.log(|| {
+                format!(
+                    "too many requests waiting, dropping a {} request",
+                    request.category.name()
+                )
+            });
+            self.shared.finish();
+            return;
+        }
         self.seq += 1;
         self.delayed.push(Reverse((
             Instant::now() + wait,
@@ -297,6 +338,10 @@ impl Worker {
     }
 
     fn deliver(&mut self, request: Request) {
+        if self.shared.stopping.load(Ordering::Relaxed) {
+            self.shared.finish();
+            return;
+        }
         let wait = self.paused_for(request.category, Instant::now());
         if !wait.is_zero() {
             if wait > MAX_WAIT {
@@ -371,7 +416,7 @@ impl Worker {
         let retry_after = header("Retry-After")
             .and_then(|s| s.trim().parse::<u64>().ok())
             .filter(|s| *s > 0)
-            .map(Duration::from_secs);
+            .map(|s| Duration::from_secs(s.min(MAX_PAUSE)));
         let limits = header("Fixwire-Rate-Limits");
         let status = response.status().as_u16();
         let _ = response
@@ -402,7 +447,7 @@ impl Worker {
             if secs == 0 {
                 continue;
             }
-            let until = now + Duration::from_secs(secs);
+            let until = now + Duration::from_secs(secs.min(MAX_PAUSE));
             let names: Vec<Option<Category>> = if categories.trim().is_empty() {
                 vec![None]
             } else {
@@ -430,4 +475,56 @@ fn category_named(name: &str) -> Option<Category> {
         "feedback" => Category::Feedback,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn worker(max_delayed: usize) -> Worker {
+        Worker {
+            dsn: "http://k@127.0.0.1:9".parse().unwrap(),
+            agent: ureq::Agent::new_with_defaults(),
+            shared: Arc::new(Shared {
+                state: Mutex::new(State {
+                    pending: 0,
+                    until: HashMap::new(),
+                    stopped: false,
+                }),
+                idle: Condvar::new(),
+                stopping: AtomicBool::new(false),
+                debug: false,
+            }),
+            delayed: BinaryHeap::new(),
+            max_delayed,
+            seq: 0,
+        }
+    }
+
+    #[test]
+    fn requests_waiting_out_a_pause_are_bounded() {
+        let mut w = worker(10);
+        w.limit("60:error", Instant::now());
+        for _ in 0..1000 {
+            lock(&w.shared.state).pending += 1;
+            w.deliver(Request::json("/v1/logs", Category::Error, Vec::new()));
+        }
+        assert_eq!(w.delayed.len(), 10);
+        assert_eq!(lock(&w.shared.state).pending, 10, "the rest are dropped");
+    }
+
+    #[test]
+    fn pauses_past_the_clock_are_bounded() {
+        let w = worker(10);
+        let now = Instant::now();
+        w.limit("18446744073709551615:error, 99999999999999999:", now);
+        let state = lock(&w.shared.state);
+        assert_eq!(state.until.len(), 2);
+        assert!(
+            state
+                .until
+                .values()
+                .all(|u| *u == now + Duration::from_secs(MAX_PAUSE))
+        );
+    }
 }

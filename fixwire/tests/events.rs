@@ -381,6 +381,108 @@ fn retries_what_failed_and_pauses_what_is_limited() {
 }
 
 #[test]
+fn pauses_past_the_clock_are_cut_to_a_day() {
+    let ingest = Ingest::start();
+    // Seconds the clock can't add: the sending thread lives on, errors wait a day.
+    ingest.answer([
+        (
+            200,
+            vec![("Fixwire-Rate-Limits", "18446744073709551615:error".into())],
+        ),
+        (503, vec![("Retry-After", "18446744073709551615".into())]),
+    ]);
+    let hub = hub(&ingest, Options::default());
+    let feedback = |score| {
+        Hub::run(hub.clone(), || {
+            fixwire::capture_feedback(Feedback {
+                score: Some(score),
+                ..Feedback::default()
+            })
+        })
+    };
+    Hub::run(hub.clone(), || {
+        fixwire::capture_message("paused for a day", Level::Info)
+    });
+    ingest.wait_for("/v1/logs", 1);
+    feedback(1.0); // retried in a day
+    ingest.wait_for("/v1/feedback", 1);
+    feedback(-1.0);
+    assert_eq!(ingest.wait_for("/v1/feedback", 2).len(), 2);
+}
+
+#[test]
+fn redirects_are_not_followed() {
+    let elsewhere = Ingest::start();
+    let ingest = Ingest::start();
+    let location = format!("http://127.0.0.1:{}/v1/logs", elsewhere.port);
+    ingest.answer([(307, vec![("Location", location)])]);
+    let hub = hub(&ingest, Options::default());
+    Hub::run(hub.clone(), || {
+        fixwire::capture_message("stays home", Level::Info)
+    });
+    flush(&hub);
+    assert_eq!(ingest.on("/v1/logs").len(), 1);
+    assert!(
+        elsewhere.received().is_empty(),
+        "neither the key nor the data go elsewhere"
+    );
+}
+
+#[test]
+fn closing_takes_no_longer_than_asked() {
+    // A server that takes requests and never answers.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let _held: Vec<_> = listener.incoming().collect();
+    });
+    let client = Arc::new(
+        Client::new(Options {
+            dsn: Some(format!("http://k@127.0.0.1:{port}")),
+            error_budget: fixwire::ErrorBudget {
+                disabled: true,
+                ..Default::default()
+            },
+            ..Options::default()
+        })
+        .unwrap(),
+    );
+    let hub = Hub::new(Some(Arc::clone(&client)), Scope::default());
+    Hub::run(hub, || {
+        for _ in 0..150 {
+            fixwire::capture_message("never answered", Level::Info);
+        }
+    });
+    let start = std::time::Instant::now();
+    client.close(Duration::from_millis(200));
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn events_over_a_megabyte_go_without_their_extras_or_not_at_all() {
+    let ingest = Ingest::start();
+    let hub = hub(&ingest, Options::default());
+    let huge = "x".repeat(1_100_000);
+    let (smaller, dropped) = Hub::run(hub.clone(), || {
+        fixwire::configure_scope(|s| s.set_extra("dump", huge.clone()));
+        let smaller = fixwire::capture_message("the report is too large", Level::Error);
+        fixwire::configure_scope(|s| s.set_extra("dump", Value::Null));
+        (smaller, fixwire::capture_message(huge, Level::Error))
+    });
+    flush(&hub);
+    assert!(smaller.is_some());
+    assert_eq!(dropped, None);
+    let records = ingest.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["body"]["stringValue"], "the report is too large");
+    assert!(!attrs(&records[0]).contains_key("dump"));
+}
+
+#[test]
 fn without_a_dsn_nothing_is_sent() {
     let client = Client::new(Options {
         dsn: Some(String::new()),
