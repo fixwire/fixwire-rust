@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["fixwire"]
+members = ["fixwire", "examples"]
 
 [workspace.package]
 edition = "2024"

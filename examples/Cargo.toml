@@ -1,0 +1,33 @@
+[package]
+name = "fixwire-examples"
+version = "0.1.0"
+description = "Real programs reporting to Fixwire, run against a fake ingest by the tests"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "shop-api"
+path = "shop-api/main.rs"
+
+[[bin]]
+name = "nightly-report"
+path = "nightly-report/main.rs"
+
+[dependencies]
+# An app of yours adds `fixwire = { version = "0.1", features = ["axum", "tracing"] }`.
+fixwire = { path = "../fixwire", features = ["axum", "tracing"] }
+axum = "0.8.9"
+reqwest = { version = "0.13.5", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.2", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tower-http = { version = "0.7.1", features = ["catch-panic"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["fmt"] }
+
+[dev-dependencies]
+flate2 = "1.1.10"
+ureq = "3.4.2"
