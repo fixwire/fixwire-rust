@@ -28,7 +28,7 @@ jobs:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
       - name: test (the SDK with every feature, and the examples against a fake ingest)
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --no-fail-fast
 
   features:
     name: each feature on its own

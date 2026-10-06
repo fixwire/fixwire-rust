@@ -185,17 +185,18 @@ fn without_generics(name: &str) -> String {
 }
 
 /// `{closure#0}` and `{{closure}}` as `{closure}`, `{async_block#2}` as
-/// `{async_block}`, `{shim:vtable#0}` as `{shim:vtable}`.
+/// `{async_block}`, `{shim:vtable#0}` as `{shim:vtable}`; and the names
+/// Windows' debug information gives, `closure$0` and `impl$3`, as
+/// `{closure}` and `{impl}`.
 fn without_indexes(name: &str) -> String {
     static INDEX: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\{\{([a-z_]+)\}\}|\{([a-z_:]+)#[0-9]+\}").expect("a valid pattern")
+        Regex::new(r"\{\{([a-z_]+)\}\}|\{([a-z_:]+)#[0-9]+\}|\b([a-z_]+)\$[0-9]+\b")
+            .expect("a valid pattern")
     });
     INDEX
         .replace_all(name, |c: &regex::Captures<'_>| {
-            format!(
-                "{{{}}}",
-                c.get(1).or_else(|| c.get(2)).map_or("", |m| m.as_str())
-            )
+            let kind = c.get(1).or_else(|| c.get(2)).or_else(|| c.get(3));
+            format!("{{{}}}", kind.map_or("", |m| m.as_str()))
         })
         .into_owned()
 }
@@ -370,6 +371,19 @@ mod tests {
                 ),
             ),
             ("index<&str, usize>", (None, "index")),
+            // Windows (MSVC debug information)
+            (
+                "events::errors_go::closure$0",
+                (Some("events::errors_go"), "{closure}"),
+            ),
+            (
+                "alloc::vec::impl$13::index<&str>",
+                (Some("alloc::vec::{impl}"), "index"),
+            ),
+            (
+                "shop_api::checkout::async_fn$0",
+                (Some("shop_api::checkout"), "{async_fn}"),
+            ),
             ("crème::brûlée::<u8>", (Some("crème"), "brûlée")),
             (
                 "shop_api::checkout::{async_fn#0}",
