@@ -32,6 +32,17 @@ fn panics_are_crashes_and_the_previous_hook_still_runs() {
         dsn: Some(ingest.dsn()),
         release: Some("shop@1.0.0".into()),
         project_root: Some(env!("CARGO_MANIFEST_DIR").into()),
+        // A callback that panics while a panic is reported: in the hook itself that would end
+        // the process; the event goes as it was.
+        before_send: Some(Arc::new(|e: fixwire::Event| {
+            if e.exceptions
+                .iter()
+                .any(|x| x.message.contains("InvalidDigit"))
+            {
+                panic!("a bug in before_send");
+            }
+            Some(e)
+        })),
         ..Options::default()
     });
     let hub = Hub::main().fork();

@@ -168,11 +168,7 @@ pub(crate) fn issue_of(e: &Event) -> u64 {
 
 /// The first `MAX_MESSAGE` bytes of a message, cut on a character boundary.
 fn head(message: &str) -> &str {
-    let mut end = message.len().min(MAX_MESSAGE);
-    while !message.is_char_boundary(end) {
-        end -= 1;
-    }
-    &message[..end]
+    crate::limits::head(message, MAX_MESSAGE)
 }
 
 /// FNV-1a, 64 bits: cheap, and stable across runs (unlike `DefaultHasher`).

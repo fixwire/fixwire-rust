@@ -26,6 +26,8 @@ use std::sync::OnceLock;
 use detectors::Detector;
 use scanners::Text;
 
+use crate::limits::{REDACT_AHEAD, cut, head};
+
 /// Replaces the value of a sensitive key.
 pub(crate) const FILTERED: &str = "[Filtered]";
 
@@ -165,6 +167,26 @@ impl Redactor {
         }
         out.push_str(&text[last..]);
         (Cow::Owned(out), found.iter().map(|f| f.name).collect())
+    }
+
+    /// Masks `text`, then cuts it to `limit` bytes ending in `...` (see
+    /// `limits::cut`). The masking reads the part kept and the next 16 kB, so
+    /// a secret the cut goes through is still masked, and no further: a huge
+    /// text costs what a short one does.
+    pub(crate) fn mask_within<'a>(
+        &self,
+        text: &'a str,
+        limit: usize,
+    ) -> (Cow<'a, str>, Vec<&'static str>) {
+        let read = head(text, limit.saturating_add(REDACT_AHEAD));
+        let more = read.len() < text.len();
+        let (masked, found) = self.mask(read);
+        let masked = match masked {
+            Cow::Owned(m) if m.len() <= limit && !more => Cow::Owned(m),
+            Cow::Owned(m) => Cow::Owned(cut(&m, limit, more).into_owned()),
+            Cow::Borrowed(m) => cut(m, limit, more),
+        };
+        (masked, found)
     }
 
     /// The non-overlapping findings, sorted by start; when two overlap, the

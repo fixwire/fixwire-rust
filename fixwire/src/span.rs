@@ -10,8 +10,9 @@ use serde_json::{Map, Value, json};
 
 use crate::client::{Client, new_id};
 use crate::hub::{FutureExt, Hub, lock};
-use crate::otlp::{attributes, nanos, scope};
-use crate::transport::Category;
+use crate::limits::bounded;
+use crate::otlp::{Export, attributes, nanos};
+use crate::transport::{Category, Request};
 
 /// OpenTelemetry's span kinds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,14 +78,20 @@ struct SpanState {
     error: Option<String>,
     end: Option<SystemTime>,
     /// A segment's finished spans, until it is sent.
-    children: Vec<Value>,
+    children: Vec<Vec<u8>>,
     sent: bool,
 }
 
 /// Bounds the spans a segment keeps until it is sent.
 const MAX_CHILDREN: usize = 1000;
-/// The longest `tracestate` or `baggage` passed on (W3C baggage's limit).
-const MAX_PROPAGATED: usize = 8192;
+/// Bounds a span's attributes, `fixwire.op` among them.
+const MAX_ATTRIBUTES: usize = 128;
+/// The longest `tracestate` and `baggage` passed on (the W3C limits).
+const MAX_TRACESTATE: usize = 512;
+const MAX_BAGGAGE: usize = 8192;
+/// Bounds the spans of one request, and its bytes.
+const MAX_BATCH: usize = 100;
+const MAX_BATCH_BYTES: usize = 5 << 20;
 
 impl Span {
     fn build(
@@ -141,8 +148,8 @@ impl Span {
 
     /// A span continuing a caller's trace, from its W3C `traceparent`,
     /// `tracestate` and `baggage` headers; a new trace when `traceparent`
-    /// is missing or malformed. A `tracestate` or `baggage` longer than 8 KB,
-    /// or with control characters, is not passed on.
+    /// is missing or malformed. A `tracestate` over 512 bytes or a `baggage`
+    /// over 8,192, or either with a control character, is not passed on.
     pub fn continue_trace(
         traceparent: Option<&str>,
         tracestate: Option<&str>,
@@ -156,7 +163,10 @@ impl Span {
                 name.into(),
                 op,
                 (trace, Some(parent), sampled, true),
-                (propagated(tracestate), propagated(baggage)),
+                (
+                    propagated(tracestate, MAX_TRACESTATE),
+                    propagated(baggage, MAX_BAGGAGE),
+                ),
                 None,
                 client,
             ),
@@ -225,11 +235,14 @@ impl Span {
         lock(&self.inner.state).name = name.into();
     }
 
-    /// Sets an attribute (OpenTelemetry's semantic conventions).
+    /// Sets an attribute (OpenTelemetry's semantic conventions). A span keeps
+    /// at most 128, `fixwire.op` among them: past that, new keys are dropped.
     pub fn set_attribute(&self, key: impl Into<String>, value: impl Into<Value>) {
-        lock(&self.inner.state)
-            .attributes
-            .insert(key.into(), value.into());
+        let key = key.into();
+        let mut state = lock(&self.inner.state);
+        if state.attributes.len() < MAX_ATTRIBUTES - 1 || state.attributes.contains_key(&key) {
+            state.attributes.insert(key, value.into());
+        }
     }
 
     /// Marks the span failed, with what went wrong.
@@ -256,42 +269,52 @@ impl Span {
         else {
             return;
         };
-        let me = self.to_json(client);
-        match &self.inner.segment {
-            None => {
-                let mut spans = {
-                    let mut state = lock(&self.inner.state);
-                    state.sent = true;
-                    std::mem::take(&mut state.children)
-                };
-                spans.push(me);
-                send_spans(client, spans);
-            }
-            Some(segment) => {
-                let mut state = lock(&segment.inner.state);
-                if state.sent {
-                    drop(state);
-                    send_spans(client, vec![me]);
-                } else if state.children.len() < MAX_CHILDREN {
-                    state.children.push(me);
+        crate::hub::guarded(|| {
+            let Ok(me) = serde_json::to_vec(&self.to_json(client)) else {
+                return;
+            };
+            match &self.inner.segment {
+                None => {
+                    let mut spans = {
+                        let mut state = lock(&self.inner.state);
+                        state.sent = true;
+                        std::mem::take(&mut state.children)
+                    };
+                    spans.push(me);
+                    send_spans(client, spans);
+                }
+                Some(segment) => {
+                    let mut state = lock(&segment.inner.state);
+                    if state.sent {
+                        drop(state);
+                        send_spans(client, vec![me]);
+                    } else if state.children.len() < MAX_CHILDREN {
+                        state.children.push(me);
+                    }
                 }
             }
-        }
+        });
     }
 
-    /// The span as OTLP JSON, redacted by `client`.
+    /// The span as OTLP JSON, redacted by `client`, its attributes' values
+    /// bounded and its strings cut to `max_value_length`.
     fn to_json(&self, client: &Client) -> Value {
         let i = &self.inner;
         let state = lock(&i.state);
-        let mut attrs = client.scrub(state.attributes.clone(), &[]);
+        let mut attrs: Map<String, Value> = state
+            .attributes
+            .iter()
+            .map(|(k, v)| (k.clone(), bounded(v)))
+            .collect();
         attrs.insert("fixwire.op".into(), i.op.clone().into());
+        let attrs = client.scrub(attrs, &[]);
         let flags = 0x100 | if i.remote_parent { 0x200 } else { 0 } | u32::from(i.sampled);
         let status = match &state.error {
-            Some(m) => json!({"code": 2, "message": client.mask(m)}),
+            Some(m) => json!({"code": 2, "message": client.clean(m)}),
             None => json!({"code": 1}),
         };
         let mut out = json!({
-            "traceId": i.trace_id, "spanId": i.span_id, "name": client.mask(&state.name), "kind": i.kind as u8,
+            "traceId": i.trace_id, "spanId": i.span_id, "name": client.clean(&state.name), "kind": i.kind as u8,
             "startTimeUnixNano": nanos(i.start), "endTimeUnixNano": nanos(state.end.unwrap_or_else(SystemTime::now)),
             "attributes": attributes(&attrs), "status": status, "flags": flags,
         });
@@ -314,13 +337,34 @@ impl fmt::Debug for Span {
     }
 }
 
-/// Sends finished spans as one OTLP traces export.
-fn send_spans(client: &Client, spans: Vec<Value>) {
-    let body = json!({"resourceSpans": [{
-        "resource": client.resource(),
-        "scopeSpans": [{"scope": scope(), "spans": spans}],
-    }]});
-    client.send_json("/v1/traces", Category::Span, &body);
+/// Sends finished spans (their JSON) as OTLP traces exports of at most 100
+/// spans and 5 MB each; a span that can't fit in one alone is dropped.
+fn send_spans(client: &Client, spans: Vec<Vec<u8>>) {
+    let (head, tail) = client.export_ends(Export::Spans);
+    let ends = head.len() + tail.len();
+    let send = |batch: &[Vec<u8>]| {
+        let body = client.export(Export::Spans, batch);
+        client.send(Request::json("/v1/traces", Category::Span, body));
+    };
+    let (mut batch, mut size) = (Vec::new(), ends);
+    for span in spans {
+        if ends + span.len() > MAX_BATCH_BYTES {
+            client.log(|| format!("dropped a span of {} bytes: larger than 5 MB", span.len()));
+            continue;
+        }
+        // The span, and the comma before it.
+        let more = span.len() + usize::from(!batch.is_empty());
+        if batch.len() == MAX_BATCH || size + more > MAX_BATCH_BYTES {
+            send(&batch);
+            batch.clear();
+            size = ends;
+        }
+        size += span.len() + usize::from(!batch.is_empty());
+        batch.push(span);
+    }
+    if !batch.is_empty() {
+        send(&batch);
+    }
 }
 
 /// Decides a new trace the way every Fixwire SDK does: kept when its id's
@@ -345,49 +389,40 @@ pub(crate) fn sample_trace(trace_id: &str, rate: f64) -> bool {
 }
 
 /// A caller's `tracestate` or `baggage` to pass on: every span of the trace
-/// holds it and every request it makes carries it, so a huge one, or one that
-/// would break a header (CR, LF), stays out.
-fn propagated(header: Option<&str>) -> Option<String> {
+/// holds it and every request it makes carries it, so one over `max` bytes,
+/// or one with a control character that would break a header (CR, LF), stays
+/// out whole. Tabs are whitespace the W3C headers allow.
+fn propagated(header: Option<&str>, max: usize) -> Option<String> {
     header
-        .filter(|h| {
-            h.len() <= MAX_PROPAGATED && !h.bytes().any(|b| b.is_ascii_control() && b != b'\t')
-        })
+        .filter(|h| h.len() <= max && !h.bytes().any(|b| b.is_ascii_control() && b != b'\t'))
         .map(str::to_owned)
 }
 
-/// Reads `00-<trace id>-<parent id>-<flags>`: the trace, the parent and
-/// whether the trace is sampled.
+/// Reads `00-<trace id>-<parent id>-<flags>`, in lower-case hex as W3C trace
+/// context writes it: the trace, the parent and whether the trace is
+/// sampled. Anything else (another version, an id of zeros) is `None`.
 pub(crate) fn parse_traceparent(h: &str) -> Option<(String, String, bool)> {
     let parts: Vec<&str> = h.trim().split('-').collect();
-    let [version, trace, parent, flags, ..] = parts[..] else {
+    let [version, trace, parent, flags] = parts[..] else {
         return None;
     };
-    let hex = |s: &str| s.bytes().all(|b| b.is_ascii_hexdigit());
+    let hex = |s: &str| s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     let zero = |s: &str| s.bytes().all(|b| b == b'0');
-    if version.len() != 2
-        || version == "ff"
-        || trace.len() != 32
-        || parent.len() != 16
-        || flags.len() != 2
-    {
+    if version != "00" || trace.len() != 32 || parent.len() != 16 || flags.len() != 2 {
         return None;
     }
-    if !hex(version) || !hex(trace) || !hex(parent) || zero(trace) || zero(parent) {
+    if !hex(trace) || !hex(parent) || !hex(flags) || zero(trace) || zero(parent) {
         return None;
     }
     let flags = u8::from_str_radix(flags, 16).ok()?;
-    Some((
-        trace.to_ascii_lowercase(),
-        parent.to_ascii_lowercase(),
-        flags & 1 == 1,
-    ))
+    Some((trace.to_owned(), parent.to_owned(), flags & 1 == 1))
 }
 
 /// Starts a span under the current scope's span, or a new trace. Finish it
 /// when the work ends; `trace` does both.
 pub fn start_span(name: impl Into<String>, op: &str) -> Span {
     let hub = Hub::current();
-    match hub.configure_scope(|s| s.span.clone()) {
+    match hub.try_configure_scope(|s| s.span.clone()).flatten() {
         Some(parent) => parent.start_child(name, op),
         None => Span::new_trace(name, op, hub.client()),
     }
@@ -454,18 +489,31 @@ mod tests {
     #[test]
     fn reads_traceparents() {
         assert_eq!(
-            parse_traceparent("00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-01"),
+            parse_traceparent(" 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 "),
             Some((
                 "4bf92f3577b34da6a3ce929d0e0e4736".into(),
                 "00f067aa0ba902b7".into(),
                 true
             ))
         );
+        assert_eq!(
+            parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00")
+                .map(|t| t.2),
+            Some(false)
+        );
         for bad in [
             "",
             "00-4bf9-00f0-01",
             "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
             "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+            "00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e473g-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-1",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0x",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-+1",
         ] {
             assert_eq!(parse_traceparent(bad), None, "{bad}");
         }
@@ -516,5 +564,43 @@ mod tests {
             (span.tracestate(), span.baggage()),
             (Some("v=1"), Some("plan=team,\tregion=eu"))
         );
+        // At the limits they pass; a byte over, they are dropped whole.
+        let sized = |n: usize| format!("k={}", "v".repeat(n - 2));
+        for (state, baggage, passed) in [
+            (sized(512), sized(8192), true),
+            (sized(513), sized(8192), false),
+            (sized(512), sized(8193), false),
+        ] {
+            let span = Span::continue_trace(
+                parent,
+                Some(&state),
+                Some(&baggage),
+                "GET /",
+                "http.server",
+                None,
+            );
+            assert_eq!(span.tracestate().is_some(), state.len() <= 512);
+            assert_eq!(span.baggage().is_some(), baggage.len() <= 8192);
+            assert_eq!(
+                span.tracestate().is_some() && span.baggage().is_some(),
+                passed
+            );
+        }
+        for control in ["\u{0}", "\u{7f}", "\r", "\n", "\u{1b}"] {
+            let header = format!("k=v{control}");
+            let span = Span::continue_trace(
+                parent,
+                Some(&header),
+                Some(&header),
+                "GET /",
+                "http.server",
+                None,
+            );
+            assert_eq!(
+                (span.tracestate(), span.baggage()),
+                (None, None),
+                "{header:?}"
+            );
+        }
     }
 }

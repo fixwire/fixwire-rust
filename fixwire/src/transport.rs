@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -59,8 +59,8 @@ impl Request {
     }
 }
 
-/// The sends of one request, and the longest a paused request waits before
-/// it is dropped.
+/// The sends of one request (3 retries), and the longest a request waits for
+/// its next try: one due later is dropped.
 const MAX_ATTEMPTS: u32 = 4;
 const MAX_WAIT: Duration = Duration::from_secs(300);
 /// The longest pause an answer may ask for (a day): a longer one would
@@ -113,7 +113,7 @@ pub(crate) struct Transport {
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
-/// The first retry's wait, halved (tests shorten it).
+/// The first retry's wait, doubled for each one after (tests shorten it).
 #[cfg(not(test))]
 const BACKOFF_UNIT: Duration = Duration::from_secs(1);
 #[cfg(test)]
@@ -308,6 +308,17 @@ impl Worker {
     }
 
     fn later(&mut self, request: Request, wait: Duration) {
+        if wait > MAX_WAIT {
+            self.shared.log(|| {
+                format!(
+                    "dropping a {} request: its next try is {}s away",
+                    request.category.name(),
+                    wait.as_secs()
+                )
+            });
+            self.shared.finish();
+            return;
+        }
         if self.delayed.len() >= self.max_delayed {
             self.shared.log(|| {
                 format!(
@@ -344,18 +355,7 @@ impl Worker {
         }
         let wait = self.paused_for(request.category, Instant::now());
         if !wait.is_zero() {
-            if wait > MAX_WAIT {
-                self.shared.log(|| {
-                    format!(
-                        "dropping a {} request: paused for {}s",
-                        request.category.name(),
-                        wait.as_secs()
-                    )
-                });
-                self.shared.finish();
-            } else {
-                self.later(request, wait);
-            }
+            self.later(request, wait);
             return;
         }
         match self.post(&request) {
@@ -385,7 +385,8 @@ impl Worker {
             self.shared.finish();
             return;
         }
-        let backoff = BACKOFF_UNIT * 2u32.pow(request.attempts);
+        // About 1 s, then twice as long each time; longer when the answer asks.
+        let backoff = BACKOFF_UNIT * 2u32.pow(request.attempts - 1);
         self.later(request, backoff.max(retry_after.unwrap_or_default()));
     }
 
@@ -414,9 +415,9 @@ impl Worker {
                 .map(str::to_owned)
         };
         let retry_after = header("Retry-After")
-            .and_then(|s| s.trim().parse::<u64>().ok())
+            .and_then(|v| retry_after(&v, SystemTime::now()))
             .filter(|s| *s > 0)
-            .map(|s| Duration::from_secs(s.min(MAX_PAUSE)));
+            .map(Duration::from_secs);
         let limits = header("Fixwire-Rate-Limits");
         let status = response.status().as_u16();
         let _ = response
@@ -428,9 +429,15 @@ impl Worker {
         if let Some(limits) = &limits {
             self.limit(limits, now);
         }
+        // A 429 without Fixwire's limits pauses everything for at least a minute; a 5xx that
+        // says how long, for that long.
         if status == 429 && limits.is_none() {
             let secs = retry_after.map_or(60, |d| d.as_secs().max(60));
             self.limit(&format!("{secs}:"), now);
+        } else if status >= 500
+            && let Some(d) = retry_after
+        {
+            self.limit(&format!("{}:", d.as_secs()), now);
         }
         Ok((status, retry_after))
     }
@@ -441,13 +448,13 @@ impl Worker {
         let mut state = lock(&self.shared.state);
         for part in header.split(',') {
             let (secs, categories) = part.trim().split_once(':').unwrap_or((part.trim(), ""));
-            let Ok(secs) = secs.trim().parse::<u64>() else {
+            let Some(secs) = seconds(secs.trim()) else {
                 continue;
             };
             if secs == 0 {
                 continue;
             }
-            let until = now + Duration::from_secs(secs.min(MAX_PAUSE));
+            let until = now + Duration::from_secs(secs);
             let names: Vec<Option<Category>> = if categories.trim().is_empty() {
                 vec![None]
             } else {
@@ -464,6 +471,68 @@ impl Worker {
             }
         }
     }
+}
+
+/// Seconds as answers write them, cut to a day (more digits than a `u64`
+/// holds too); `None` when they aren't digits.
+fn seconds(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(s.parse::<u64>().map_or(MAX_PAUSE, |n| n.min(MAX_PAUSE)))
+}
+
+/// The seconds a `Retry-After` asks to wait from `now`, as seconds or an
+/// HTTP date, cut to a day; `None` when it is neither.
+fn retry_after(value: &str, now: SystemTime) -> Option<u64> {
+    let value = value.trim();
+    if let Some(s) = seconds(value) {
+        return Some(s);
+    }
+    let at = http_date(value)?;
+    let now = now.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(at.saturating_sub(now).min(MAX_PAUSE))
+}
+
+/// An HTTP date as Unix seconds: `Sun, 06 Nov 1994 08:49:37 GMT`, or the
+/// obsolete forms recipients still read, `Sunday, 06-Nov-94 08:49:37 GMT` and
+/// `Sun Nov  6 08:49:37 1994`.
+fn http_date(s: &str) -> Option<u64> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let tokens: Vec<&str> = s.split([' ', ',', '-']).filter(|t| !t.is_empty()).collect();
+    let (day, month, year, time) = match tokens[..] {
+        [_, day, month, year, time, "GMT"] => (day, month, year, time),
+        [_, month, day, time, year] => (day, month, year, time),
+        _ => return None,
+    };
+    let number = |s: &str, max: u64| s.parse::<u64>().ok().filter(|n| *n <= max);
+    let month = MONTHS.iter().position(|m| *m == month)? as u64 + 1;
+    let day = number(day, 31).filter(|d| *d > 0)?;
+    let year = match number(year, 9999)? {
+        y if y < 70 && year.len() == 2 => y + 2000,
+        y if year.len() == 2 => y + 1900,
+        y if y < 1970 => return None,
+        y => y,
+    };
+    let mut hms = time.split(':');
+    let (h, m, sec) = (hms.next()?, hms.next()?, hms.next()?);
+    if hms.next().is_some() {
+        return None;
+    }
+    let (h, m, sec) = (number(h, 23)?, number(m, 59)?, number(sec, 60)?);
+    // Howard Hinnant's days_from_civil, from 1970 on.
+    let (y, mo) = if month <= 2 {
+        (year - 1, month + 9)
+    } else {
+        (year, month - 3)
+    };
+    let (era, yoe) = (y / 400, y % 400);
+    let doy = (153 * mo + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = (era * 146_097 + doe).checked_sub(719_468)?;
+    Some(days * 86_400 + h * 3_600 + m * 60 + sec)
 }
 
 fn category_named(name: &str) -> Option<Category> {
@@ -511,6 +580,101 @@ mod tests {
         }
         assert_eq!(w.delayed.len(), 10);
         assert_eq!(lock(&w.shared.state).pending, 10, "the rest are dropped");
+    }
+
+    #[test]
+    fn retry_after_is_seconds_or_an_http_date_within_a_day() {
+        // Sun, 06 Nov 1994 08:49:00 GMT
+        let now = UNIX_EPOCH + Duration::from_secs(784_111_740);
+        assert_eq!(
+            http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+        for (value, secs) in [
+            ("120", Some(120)),
+            (" 7 ", Some(7)),
+            ("86400", Some(86_400)),
+            ("86401", Some(86_400)),
+            ("99999999999999999999999", Some(86_400)),
+            ("0", Some(0)),
+            ("-1", None),
+            ("1.5", None),
+            ("soon", None),
+            ("", None),
+            ("Sun, 06 Nov 1994 08:49:37 GMT", Some(37)),
+            ("Sunday, 06-Nov-94 08:49:37 GMT", Some(37)),
+            ("Sun Nov  6 08:49:37 1994", Some(37)),
+            ("Mon, 07 Nov 1994 08:49:01 GMT", Some(86_400)),
+            ("Tue, 08 Nov 1994 08:49:00 GMT", Some(86_400)),
+            ("Sun, 06 Nov 1994 08:48:00 GMT", Some(0)),
+            ("Sun, 06 Nov 1994 08:49:37 CET", None),
+            ("Sun, 32 Nov 1994 08:49:37 GMT", None),
+            ("Sun, 06 Nov 1994 24:49:37 GMT", None),
+            ("Sun, 06 Foo 1994 08:49:37 GMT", None),
+            ("Sun, 06 Nov 1969 08:49:37 GMT", None),
+        ] {
+            assert_eq!(retry_after(value, now), secs, "{value:?}");
+        }
+        assert_eq!(http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(
+            http_date("Sat, 29 Feb 2000 00:00:00 GMT"),
+            Some(951_782_400)
+        );
+    }
+
+    #[test]
+    fn retries_wait_a_unit_then_twice_as_long_up_to_three_times() {
+        let mut w = worker(10);
+        lock(&w.shared.state).pending += 1;
+        let mut request = Request::json("/v1/logs", Category::Error, Vec::new());
+        for (attempt, unit) in [(1, 1), (2, 2), (3, 4)] {
+            let before = Instant::now();
+            w.retry(request, "503".into(), None);
+            let Some(Reverse((due, _, DelayedRequest(r)))) = w.delayed.pop() else {
+                panic!("retry {attempt} is waiting");
+            };
+            let wait = due - before;
+            assert!(
+                wait >= BACKOFF_UNIT * unit && wait < BACKOFF_UNIT * unit * 2,
+                "{wait:?}"
+            );
+            request = r;
+        }
+        w.retry(request, "503".into(), None);
+        assert!(w.delayed.is_empty(), "no fourth retry");
+        assert_eq!(lock(&w.shared.state).pending, 0, "dropped");
+    }
+
+    #[test]
+    fn a_next_try_past_five_minutes_drops_the_request() {
+        let mut w = worker(10);
+        lock(&w.shared.state).pending += 2;
+        let r = || Request::json("/v1/logs", Category::Error, Vec::new());
+        w.retry(r(), "503".into(), Some(Duration::from_secs(300)));
+        assert_eq!(w.delayed.len(), 1, "five minutes wait");
+        w.retry(r(), "503".into(), Some(Duration::from_secs(301)));
+        assert_eq!(w.delayed.len(), 1);
+        assert_eq!(lock(&w.shared.state).pending, 1, "the other is dropped");
+    }
+
+    #[test]
+    fn only_known_categories_pause() {
+        let w = worker(10);
+        let now = Instant::now();
+        w.limit(
+            "60:log;file;metric_bucket, 30:span, x:error, 86401:session",
+            now,
+        );
+        let state = lock(&w.shared.state);
+        assert_eq!(state.until.len(), 2);
+        assert_eq!(
+            state.until[&Some(Category::Span)],
+            now + Duration::from_secs(30)
+        );
+        assert_eq!(
+            state.until[&Some(Category::Session)],
+            now + Duration::from_secs(MAX_PAUSE)
+        );
     }
 
     #[test]

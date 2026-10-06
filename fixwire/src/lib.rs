@@ -32,6 +32,7 @@ mod client;
 mod dsn;
 mod http;
 mod hub;
+mod limits;
 mod options;
 mod otlp;
 mod panic;

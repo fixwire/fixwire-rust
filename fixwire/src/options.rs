@@ -44,8 +44,13 @@ pub struct Options {
     /// The share of new traces kept (default 0: no tracing). Traces
     /// continued from a caller follow its decision.
     pub traces_sample_rate: f64,
-    /// The URLs outgoing requests carry trace headers to: those holding one
-    /// of these strings (default none, so no other service sees them).
+    /// The URLs outgoing requests carry trace headers to (default none, so
+    /// no other service sees them). A URL is compared without its user info,
+    /// query and fragment: a target with `://` matches URLs that start with
+    /// it (`https://api.example.com/v2`); one starting with `/` matches
+    /// relative URLs whose path starts with it; any other is a host, with a
+    /// port if it has one, and matches that host and its subdomains
+    /// (`example.com` matches `api.example.com`, not `badexample.com`).
     pub trace_propagation_targets: Vec<String>,
 
     /// Bounds the events sent per issue and per minute, so a crash loop
@@ -67,8 +72,14 @@ pub struct Options {
     /// Replace the default key fragments (password, token, cookie, …) whose
     /// values are filtered whole.
     pub sensitive_keys: Option<Vec<String>>,
-    /// How many source lines around each of the app's frames are read when
-    /// the file is there (default 5; 0 turns it off).
+    /// The longest string sent, in bytes of UTF-8 (default 1024): a longer
+    /// one is cut on a character boundary and ends in `...`, within the
+    /// limit. Redaction runs first, over the part kept and the next 16 kB.
+    pub max_value_length: usize,
+    /// The frames sent per exception (default 100): the newest are kept.
+    pub max_stack_frames: usize,
+    /// How many source lines above and below each of the app's frames are
+    /// read when the file is there (default and most 5; 0 turns it off).
     pub context_lines: usize,
     /// The project's root: frames under it are the app's, named relative to
     /// it. The working directory when `None`.
@@ -113,6 +124,8 @@ impl Default for Options {
             send_default_pii: false,
             redact: true,
             sensitive_keys: None,
+            max_value_length: 1024,
+            max_stack_frames: 100,
             context_lines: 5,
             project_root: None,
             in_app_include: Vec::new(),
@@ -207,6 +220,14 @@ impl Options {
         }
         if self.max_queue == 0 {
             self.max_queue = 100;
+        }
+        if self.max_value_length == 0 {
+            self.max_value_length = 1024;
+        }
+        // Room for the "..." that ends a cut string.
+        self.max_value_length = self.max_value_length.max(3);
+        if self.max_stack_frames == 0 {
+            self.max_stack_frames = 100;
         }
         if self.session_interval.is_zero() {
             self.session_interval = Duration::from_secs(60);

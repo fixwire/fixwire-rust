@@ -1,11 +1,13 @@
 //! The server's JSON walk: every string masked, the values of sensitive keys
 //! filtered whole, keys masked too.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
 use super::{FILTERED, Redactor};
+use crate::limits::cut;
 
 /// Containers nested deeper than this stay as they are (the server masks
 /// them), so a hostile value cannot exhaust the stack.
@@ -18,55 +20,70 @@ impl Redactor {
     /// sensitive key and a value is a pair, and keys hold data too. Returns a
     /// new value, in the input's key order (with serde_json's `preserve_order`
     /// feature), and the number of values masked; the input is never changed.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn walk(&self, value: &Value) -> (Value, usize) {
+        self.walk_within(value, usize::MAX)
+    }
+
+    /// `walk`, with every string and key cut to `limit` bytes after it is
+    /// masked (see `mask_within`).
+    pub(crate) fn walk_within(&self, value: &Value, limit: usize) -> (Value, usize) {
         let mut count = 0;
-        let out = self.walk_value(value, &mut count, 0);
+        let out = self.walk_value(value, &mut count, 0, limit);
         (out, count)
     }
 
-    fn walk_value(&self, value: &Value, n: &mut usize, depth: usize) -> Value {
+    fn walk_value(&self, value: &Value, n: &mut usize, depth: usize, limit: usize) -> Value {
         match value {
             Value::String(s) => {
-                let (masked, found) = self.mask(s);
+                let (masked, found) = self.mask_within(s, limit);
                 *n += found.len();
                 Value::String(masked.into_owned())
             }
-            Value::Array(items) if depth < MAX_DEPTH => self.walk_array(items, n, depth),
-            Value::Object(map) if depth < MAX_DEPTH => self.walk_object(map, n, depth),
+            Value::Array(items) if depth < MAX_DEPTH => self.walk_array(items, n, depth, limit),
+            Value::Object(map) if depth < MAX_DEPTH => self.walk_object(map, n, depth, limit),
             other => other.clone(),
         }
     }
 
     /// Some maps are sent as `[key, value]` pairs (headers, tags).
-    fn walk_array(&self, items: &[Value], n: &mut usize, depth: usize) -> Value {
+    fn walk_array(&self, items: &[Value], n: &mut usize, depth: usize, limit: usize) -> Value {
         if let [Value::String(key), value] = items
             && !is_empty(value)
             && self.sensitive(key)
         {
             *n += 1;
-            return Value::Array(vec![items[0].clone(), Value::from(FILTERED)]);
+            let key = cut(key, limit, false).into_owned();
+            return Value::Array(vec![Value::from(key), Value::from(FILTERED)]);
         }
         Value::Array(
             items
                 .iter()
-                .map(|item| self.walk_value(item, n, depth + 1))
+                .map(|item| self.walk_value(item, n, depth + 1, limit))
                 .collect(),
         )
     }
 
-    fn walk_object(&self, map: &Map<String, Value>, n: &mut usize, depth: usize) -> Value {
+    fn walk_object(
+        &self,
+        map: &Map<String, Value>,
+        n: &mut usize,
+        depth: usize,
+        limit: usize,
+    ) -> Value {
         let mut out = Map::with_capacity(map.len());
-        // Keys that mask to something else: (key, masked key, findings).
+        // Keys that mask (or are cut) to something else: (key, new key,
+        // findings).
         let mut renamed = Vec::new();
         for (key, value) in map {
-            let (masked, found) = self.mask(key);
-            if !found.is_empty() {
-                renamed.push((key.as_str(), masked.into_owned(), found.len()));
+            let (masked, found) = self.mask_within(key, limit);
+            if let Cow::Owned(masked) = masked {
+                renamed.push((key.as_str(), masked, found.len()));
             }
             let value = if !is_empty(value) && self.sensitive(key) {
                 filter(value, n)
             } else {
-                self.walk_value(value, n, depth + 1)
+                self.walk_value(value, n, depth + 1, limit)
             };
             out.insert(key.clone(), value);
         }
@@ -75,17 +92,21 @@ impl Redactor {
         }
         // Keys that mask alike are numbered in byte order of the original
         // keys, each taking the first name no key holds at its turn:
-        // "[REDACTED:email] (2)". A renamed key keeps its place.
+        // "[REDACTED:email] (2)". A renamed key keeps its place. Numbering
+        // resumes where the last key that masked alike stopped, so many keys
+        // masking alike take linear time.
         renamed.sort_unstable_by(|a, b| a.0.cmp(b.0));
         let mut taken: HashSet<String> = map.keys().cloned().collect();
         let mut names: HashMap<&str, String> = HashMap::with_capacity(renamed.len());
+        let mut next: HashMap<String, usize> = HashMap::new();
         for (key, masked, found) in renamed {
             let mut name = masked.clone();
-            let mut i = 2;
+            let mut i = next.get(&masked).copied().unwrap_or(2);
             while taken.contains(&name) {
                 name = format!("{masked} ({i})");
                 i += 1;
             }
+            next.insert(masked, i);
             taken.insert(name.clone());
             taken.remove(key);
             names.insert(key, name);

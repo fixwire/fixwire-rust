@@ -6,6 +6,7 @@ use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, RwLock, TryLockError};
 use std::task::{Context, Poll};
@@ -36,12 +37,36 @@ thread_local! {
     /// Set while the thread runs code that changes a scope: what that code
     /// captures (a panic in it, a log) doesn't wait for the lock it holds.
     static CONFIGURING: Cell<usize> = const { Cell::new(0) };
+    /// Set while the thread captures: what the app's code logs or panics
+    /// with then (a callback, a `Display`) isn't captured again.
+    static CAPTURING: Cell<usize> = const { Cell::new(0) };
 }
 
 /// A lock that a panic while it was held doesn't spoil: the SDK must keep
 /// working in a program that panicked.
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Whether the thread is capturing: logging integrations and the panic
+/// hook leave alone what happens meanwhile.
+pub(crate) fn capturing() -> bool {
+    CAPTURING.try_with(Cell::get).unwrap_or(0) > 0
+}
+
+/// Runs the SDK's work for an entry point, or the app's code it calls (a
+/// callback, an error's `Display`), as capturing: a panic in it stays out of
+/// the app's way (`None`), and isn't reported as a crash.
+pub(crate) fn guarded<R>(f: impl FnOnce() -> R) -> Option<R> {
+    struct Capturing;
+    impl Drop for Capturing {
+        fn drop(&mut self) {
+            let _ = CAPTURING.try_with(|c| c.set(c.get().saturating_sub(1)));
+        }
+    }
+    let _ = CAPTURING.try_with(|c| c.set(c.get() + 1));
+    let _capturing = Capturing;
+    std::panic::catch_unwind(AssertUnwindSafe(f)).ok()
 }
 
 impl Hub {
@@ -125,7 +150,7 @@ impl Hub {
     /// The current scope for the SDK's own use: `None` when the thread is
     /// changing a scope and this one is locked (by that thread, perhaps), so
     /// the SDK never waits for a lock its own thread holds.
-    fn try_configure_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> Option<R> {
+    pub(crate) fn try_configure_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> Option<R> {
         let mut scopes = if CONFIGURING.with(Cell::get) > 0 {
             match self.inner.scopes.try_lock() {
                 Ok(scopes) => scopes,
@@ -163,9 +188,11 @@ impl Hub {
     pub fn capture_error<E: Error + ?Sized>(&self, err: &E) -> Option<String> {
         // No stack is taken for a client that sends nothing.
         let client = self.client().filter(|c| c.is_enabled())?;
+        // The stack is taken first: where it is captured, not the guard's frames.
         let frames = stacktrace::capture(client.options());
+        let exceptions = guarded(|| exceptions_of(err, frames, Mechanism::default()))?;
         self.capture_event(Event {
-            exceptions: exceptions_of(err, frames, Mechanism::default()),
+            exceptions,
             ..Event::default()
         })
     }
@@ -185,18 +212,21 @@ impl Hub {
         if !client.is_enabled() {
             return None;
         }
-        self.try_configure_scope(|scope| {
-            scope.apply_to(&mut event);
-            // The session counts the error whether or not it is sent.
-            match event.exceptions.first() {
-                Some(x) => scope.mark_session(!x.mechanism.handled),
-                None if matches!(event.level, Some(Level::Error | Level::Fatal)) => {
-                    scope.mark_session(false)
+        guarded(|| {
+            self.try_configure_scope(|scope| {
+                scope.apply_to(&mut event);
+                // The session counts the error whether or not it is sent.
+                match event.exceptions.first() {
+                    Some(x) => scope.mark_session(!x.mechanism.handled),
+                    None if matches!(event.level, Some(Level::Error | Level::Fatal)) => {
+                        scope.mark_session(false)
+                    }
+                    None => {}
                 }
-                None => {}
-            }
-        });
-        client.capture(event)
+            });
+            client.capture(event)
+        })
+        .flatten()
     }
 
     /// Records something that happened, on the current scope.
@@ -212,9 +242,18 @@ impl Hub {
             })
             .unwrap_or((100, None));
         let breadcrumb = match before {
-            Some(f) => match f(breadcrumb) {
-                Some(b) => b,
-                None => return,
+            // A callback that panics is skipped: the breadcrumb is kept as it was.
+            Some(f) => match guarded(|| f(breadcrumb.clone())) {
+                Some(Some(b)) => b,
+                Some(None) => return,
+                None => {
+                    if let Some(c) = &client {
+                        c.log(|| {
+                            "before_breadcrumb panicked: the breadcrumb is kept as it was".into()
+                        });
+                    }
+                    breadcrumb
+                }
             },
             None => breadcrumb,
         };
@@ -237,42 +276,62 @@ impl fmt::Debug for Hub {
 }
 
 /// Bounds the errors of a chain read from `source()`.
-const MAX_CHAIN: usize = 10;
+pub(crate) const MAX_CHAIN: usize = 10;
 
 /// An error and its sources as exceptions, the outermost first; the
-/// outermost gets `frames`, the stack where it was captured.
+/// outermost gets `frames`, the stack where it was captured. The chain ends
+/// where it comes back to an error already in it. What the errors' own code
+/// fails to give (a `Display` that panics) is `[Unreadable]`, or ends the
+/// chain.
 pub(crate) fn exceptions_of<E: Error + ?Sized>(
     err: &E,
     frames: Vec<Frame>,
     mechanism: Mechanism,
 ) -> Vec<Exception> {
+    let message_of =
+        |e: &dyn Error| guarded(|| e.to_string()).unwrap_or_else(|| "[Unreadable]".into());
+    let type_of = |e: &dyn Error| guarded(|| debug_type(e)).unwrap_or_else(|| "Error".into());
     let (ty, module) = match static_type::<E>() {
         Some(t) => t,
-        None => (debug_type(err), None),
+        None => (
+            guarded(|| debug_type(err)).unwrap_or_else(|| "Error".into()),
+            None,
+        ),
     };
     let mut out = vec![Exception {
         ty,
         module,
-        message: err.to_string(),
+        message: guarded(|| err.to_string()).unwrap_or_else(|| "[Unreadable]".into()),
         mechanism,
         frames,
     }];
-    let mut next = err.source();
+    // To tell when the chain comes back to an error: a source is known by its pointer (where it
+    // is and its type), the outermost by where it is, its type's name and its message (a
+    // struct's first field is where the struct is, and may be its source).
+    let outer_at: *const () = (err as *const E).cast();
+    let mut seen: Vec<*const (dyn Error + 'static)> = Vec::new();
+    let mut next = guarded(|| err.source()).flatten();
     while let Some(e) = next {
-        if out.len() >= MAX_CHAIN {
+        if out.len() >= MAX_CHAIN || seen.iter().any(|s| std::ptr::eq(*s, e)) {
             break;
         }
+        let (ty, message) = (type_of(e), message_of(e));
+        let at: *const () = (e as *const dyn Error).cast();
+        if at == outer_at && ty == out[0].ty && message == out[0].message {
+            break;
+        }
+        seen.push(e);
         out.push(Exception {
-            ty: debug_type(e),
+            ty,
             module: None,
-            message: e.to_string(),
+            message,
             mechanism: Mechanism {
                 ty: "chained".into(),
                 handled: out[0].mechanism.handled,
             },
             frames: Vec::new(),
         });
-        next = e.source();
+        next = guarded(|| e.source()).flatten();
     }
     out
 }
@@ -403,6 +462,103 @@ mod tests {
         assert_eq!(
             debug_type(&std::io::Error::from(std::io::ErrorKind::NotFound)),
             "Error"
+        );
+    }
+
+    /// An error whose source is the next one down, `n` deep.
+    #[derive(Debug)]
+    struct Nested(Option<Box<Nested>>, usize);
+    impl fmt::Display for Nested {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "level {}", self.1)
+        }
+    }
+    impl Error for Nested {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            self.0.as_deref().map(|e| e as &(dyn Error + 'static))
+        }
+    }
+
+    /// Errors whose chains come back: to itself, and to the first of two.
+    #[derive(Debug)]
+    struct Again(u8);
+    impl fmt::Display for Again {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "again {}", self.0)
+        }
+    }
+    impl Error for Again {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(self)
+        }
+    }
+    #[derive(Debug)]
+    struct Ping(u8);
+    #[derive(Debug)]
+    struct Pong(u8);
+    static PING: Ping = Ping(1);
+    static PONG: Pong = Pong(2);
+    impl fmt::Display for Ping {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "ping {}", self.0)
+        }
+    }
+    impl fmt::Display for Pong {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "pong {}", self.0)
+        }
+    }
+    impl Error for Ping {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(&PONG)
+        }
+    }
+    impl Error for Pong {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(&PING)
+        }
+    }
+
+    #[test]
+    fn chains_stop_at_ten_and_where_they_come_back() {
+        let eleven = (1..11).fold(Nested(None, 10), |e, n| Nested(Some(Box::new(e)), 10 - n));
+        let chain = exceptions_of(&eleven, Vec::new(), Mechanism::default());
+        assert_eq!(chain.len(), MAX_CHAIN);
+        assert_eq!(
+            (chain[0].message.as_str(), chain[9].message.as_str()),
+            ("level 0", "level 9")
+        );
+        let names = |chain: &[Exception]| chain.iter().map(|x| x.ty.clone()).collect::<Vec<_>>();
+        let chain = exceptions_of(&Again(0), Vec::new(), Mechanism::default());
+        assert_eq!(names(&chain), ["Again"]);
+        let chain = exceptions_of(&PING, Vec::new(), Mechanism::default());
+        assert_eq!(names(&chain), ["Ping", "Pong"]);
+        // Another Pong that says the same: one of the loop it leads to.
+        let boxed: Box<dyn Error> = Box::new(Pong(2));
+        let chain = exceptions_of(&*boxed, Vec::new(), Mechanism::default());
+        assert_eq!(names(&chain), ["Pong", "Ping", "Pong"]);
+    }
+
+    #[test]
+    fn errors_that_fail_to_print_are_unreadable() {
+        #[derive(Debug)]
+        struct Broken;
+        impl fmt::Display for Broken {
+            fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+                Err(fmt::Error) // makes to_string panic
+            }
+        }
+        impl Error for Broken {}
+        let chain = exceptions_of(&Charge(Declined), Vec::new(), Mechanism::default());
+        assert_eq!(
+            chain.len(),
+            2,
+            "a struct's first field is its source, not itself"
+        );
+        let chain = exceptions_of(&Broken, Vec::new(), Mechanism::default());
+        assert_eq!(
+            (chain[0].ty.as_str(), chain[0].message.as_str()),
+            ("Broken", "[Unreadable]")
         );
     }
 

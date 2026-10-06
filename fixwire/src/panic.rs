@@ -31,7 +31,9 @@ pub(crate) fn install() {
 }
 
 fn report(info: &PanicHookInfo<'_>) {
-    if REPORTING.with(|r| r.replace(true)) {
+    // A panic of the app's code the SDK runs while capturing (a callback, a `Display`) is caught
+    // there, not a crash.
+    if crate::hub::capturing() || REPORTING.try_with(|r| r.replace(true)).unwrap_or(true) {
         return;
     }
     let hub = Hub::current();
@@ -67,12 +69,26 @@ fn report(info: &PanicHookInfo<'_>) {
             ..Event::default()
         };
         event.contexts.insert("thread".into(), context);
-        hub.capture_event(event);
+        hub.try_configure_scope(|scope| {
+            scope.apply_to(&mut event);
+            scope.mark_session(true);
+        });
+        // A panic inside a panic hook ends the process, whatever would catch it: the event (and
+        // the app's before_send) goes on a thread of its own, where one is caught.
+        let sent = std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .name("fixwire-panic".into())
+                .spawn_scoped(s, || crate::hub::guarded(|| client.capture(event)))
+                .is_ok_and(|t| t.join().is_ok_and(|done| done.is_some()))
+        });
+        if !sent {
+            client.log(|| "a panic was not reported: its thread failed".into());
+        }
         // The process ends now (panic = "abort"), or soon (the main thread): what was captured goes
         // first. Elsewhere the thread unwinds and the program goes on sending.
         if cfg!(panic = "abort") || thread.name() == Some("main") {
             client.flush(Duration::from_secs(2));
         }
     }
-    REPORTING.with(|r| r.set(false));
+    let _ = REPORTING.try_with(|r| r.set(false));
 }

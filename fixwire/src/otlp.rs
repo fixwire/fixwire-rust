@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value, json};
 
 use crate::client::Client;
+use crate::limits::{bounded, bounded_map};
 use crate::types::{Event, Level};
 
 /// `v` as an OTLP JSON `AnyValue`.
@@ -77,16 +78,41 @@ impl Client {
         json!({"attributes": attributes(&a)})
     }
 
-    /// An OTLP logs export of one record.
-    pub(crate) fn logs_export(&self, record: Value) -> Value {
-        json!({"resourceLogs": [{
-            "resource": self.resource(),
-            "scopeLogs": [{"scope": scope(), "logRecords": [record]}],
-        }]})
+    /// An OTLP export of log records or spans, each already JSON: what
+    /// `json!({"resourceLogs": [{"resource": …, "scopeLogs": [{"scope": …,
+    /// "logRecords": [items]}]}]})` writes, without encoding the items again.
+    pub(crate) fn export(&self, kind: Export, items: &[Vec<u8>]) -> Vec<u8> {
+        let (head, tail) = self.export_ends(kind);
+        let size = items.iter().map(|i| i.len() + 1).sum::<usize>();
+        let mut out = Vec::with_capacity(head.len() + size + tail.len());
+        out.extend_from_slice(head.as_bytes());
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            out.extend_from_slice(item);
+        }
+        out.extend_from_slice(tail.as_bytes());
+        out
+    }
+
+    /// What an export has around its items.
+    pub(crate) fn export_ends(&self, kind: Export) -> (String, &'static str) {
+        let (resources, scopes, items) = match kind {
+            Export::Logs => ("resourceLogs", "scopeLogs", "logRecords"),
+            Export::Spans => ("resourceSpans", "scopeSpans", "spans"),
+        };
+        let head = format!(
+            r#"{{"{resources}":[{{"resource":{},"{scopes}":[{{"scope":{},"{items}":["#,
+            self.resource(),
+            scope()
+        );
+        (head, "]}]}]}")
     }
 
     /// An error or a message as a log record (`sdks/PROTOCOL.md` §4),
-    /// redacted.
+    /// redacted, the values the app gave bounded and every string cut to
+    /// `max_value_length`.
     pub(crate) fn event_record(&self, e: &Event) -> Value {
         let mut a = Map::new();
         a.insert("fixwire.event_id".into(), e.event_id.clone().into());
@@ -103,10 +129,15 @@ impl Client {
             a.insert("fixwire.suppressed".into(), e.suppressed.into());
         }
         if !e.contexts.is_empty() {
-            a.insert("fixwire.contexts".into(), json!(e.contexts));
+            let contexts: Map<String, Value> = e
+                .contexts
+                .iter()
+                .map(|(k, v)| (k.clone(), bounded_map(v).into()))
+                .collect();
+            a.insert("fixwire.contexts".into(), contexts.into());
         }
         for (k, v) in &e.extra {
-            a.entry(k.clone()).or_insert_with(|| v.clone());
+            a.entry(k.clone()).or_insert_with(|| bounded(v));
         }
         if !e.breadcrumbs.is_empty() {
             let crumbs: Vec<Value> = e
@@ -116,7 +147,7 @@ impl Client {
                     json!({
                         "timestamp": seconds(b.timestamp.unwrap_or(SystemTime::UNIX_EPOCH)),
                         "type": b.ty, "category": b.category, "message": b.message,
-                        "level": b.level.unwrap_or_default().as_str(), "data": b.data,
+                        "level": b.level.unwrap_or_default().as_str(), "data": bounded_map(&b.data),
                     })
                 })
                 .collect();
@@ -156,7 +187,7 @@ impl Client {
                 record.insert("eventName".into(), "fixwire.message".into());
                 record.insert(
                     "body".into(),
-                    any_value(&self.mask(e.message.as_deref().unwrap_or_default()).into()),
+                    any_value(&self.clean(e.message.as_deref().unwrap_or_default()).into()),
                 );
             }
             Some(outer) => {
@@ -189,7 +220,7 @@ impl Client {
                     a.insert("fixwire.handled".into(), false.into());
                 }
                 if let Some(m) = &e.message {
-                    record.insert("body".into(), any_value(&self.mask(m).into()));
+                    record.insert("body".into(), any_value(&self.clean(m).into()));
                 }
             }
         }
@@ -204,6 +235,13 @@ impl Client {
 /// The instrumentation scope: the SDK.
 pub(crate) fn scope() -> Value {
     json!({"name": crate::SDK_NAME, "version": crate::SDK_VERSION})
+}
+
+/// What an OTLP export carries.
+#[derive(Clone, Copy)]
+pub(crate) enum Export {
+    Logs,
+    Spans,
 }
 
 #[cfg(test)]

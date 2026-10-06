@@ -134,3 +134,41 @@ fn the_sdks_threads_and_scope_changes_are_left_alone() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["body"]["stringValue"], "the user's plan is gone");
 }
+
+#[test]
+fn what_is_logged_while_capturing_is_not_captured_again() {
+    let ingest = Ingest::start();
+    let client = Arc::new(
+        Client::new(Options {
+            dsn: Some(ingest.dsn()),
+            // A callback that logs: through the layer, that would capture again, and again.
+            before_send: Some(Arc::new(|e: fixwire::Event| {
+                tracing::error!("before_send saw {:?}", e.message);
+                Some(e)
+            })),
+            before_breadcrumb: Some(Arc::new(|b: fixwire::Breadcrumb| {
+                tracing::warn!("before_breadcrumb saw {:?}", b.message);
+                Some(b)
+            })),
+            ..Options::default()
+        })
+        .unwrap(),
+    );
+    let hub = Hub::new(Some(Arc::clone(&client)), Scope::default());
+    let subscriber = tracing_subscriber::registry().with(fixwire::tracing::layer());
+    tracing::subscriber::with_default(subscriber, || {
+        Hub::run(hub.clone(), || {
+            tracing::info!("a breadcrumb");
+            tracing::error!(ratio = f64::NAN, "once");
+        });
+    });
+    assert!(client.flush(Duration::from_secs(5)));
+    let records = ingest.records();
+    assert_eq!(records.len(), 1);
+    let a = attrs(&records[0]);
+    assert_eq!(records[0]["body"]["stringValue"], "once");
+    assert_eq!(a["ratio"], "NaN", "NaN as a string");
+    let crumbs = a["fixwire.breadcrumbs"].as_array().unwrap();
+    assert_eq!(crumbs.len(), 1);
+    assert_eq!(crumbs[0]["message"], "a breadcrumb");
+}

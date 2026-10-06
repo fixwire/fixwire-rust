@@ -6,7 +6,7 @@ use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::hub::{Hub, lock};
@@ -95,6 +95,9 @@ pub(crate) fn device_id(user: Option<&User>) -> String {
 /// counted without their id, so memory and the body (at most 1 MB) stay
 /// small however many users come.
 const MAX_BUCKETS: usize = 5000;
+/// The aggregates of one request (those without a user, one a minute, may
+/// pass `MAX_BUCKETS`).
+const MAX_AGGREGATES: usize = 5000;
 
 #[derive(Default)]
 struct Counts {
@@ -159,10 +162,17 @@ impl Aggregates {
 
     /// Sends what was counted.
     pub(crate) fn send(&self) {
-        let buckets = std::mem::take(&mut *lock(&self.buckets));
-        if buckets.is_empty() {
-            return;
+        for body in self.take() {
+            if let Ok(body) = serde_json::to_vec(&body) {
+                self.transport
+                    .send(Request::json("/v1/sessions", Category::Session, body));
+            }
         }
+    }
+
+    /// What was counted, as bodies of at most 5000 aggregates.
+    fn take(&self) -> Vec<Value> {
+        let buckets = std::mem::take(&mut *lock(&self.buckets));
         let mut aggregates: Vec<_> = buckets.into_iter().collect();
         aggregates.sort_by(|a, b| a.0.cmp(&b.0));
         let aggregates: Vec<_> = aggregates
@@ -175,11 +185,10 @@ impl Aggregates {
                 a
             })
             .collect();
-        let body = json!({"sdk": crate::sdk(), "release": self.release, "environment": self.environment, "aggregates": aggregates});
-        if let Ok(body) = serde_json::to_vec(&body) {
-            self.transport
-                .send(Request::json("/v1/sessions", Category::Session, body));
-        }
+        aggregates
+            .chunks(MAX_AGGREGATES)
+            .map(|part| json!({"sdk": crate::sdk(), "release": self.release, "environment": self.environment, "aggregates": part}))
+            .collect()
     }
 
     pub(crate) fn stop(&self) {
@@ -248,12 +257,22 @@ mod tests {
             a.record(Status::Ok, device_id(Some(&user)), at);
         }
         a.stop();
-        let buckets = lock(&a.buckets);
-        assert_eq!(buckets.len(), MAX_BUCKETS + 1);
-        assert_eq!(
-            buckets[&(1_791_190_800, String::new())].exited,
-            100,
-            "the rest counted without their id"
-        );
+        {
+            let buckets = lock(&a.buckets);
+            assert_eq!(buckets.len(), MAX_BUCKETS + 1);
+            assert_eq!(
+                buckets[&(1_791_190_800, String::new())].exited,
+                100,
+                "the rest counted without their id"
+            );
+        }
+        // 5001 aggregates: two requests.
+        let bodies = a.take();
+        let sizes: Vec<usize> = bodies
+            .iter()
+            .map(|b| b["aggregates"].as_array().unwrap().len())
+            .collect();
+        assert_eq!(sizes, [MAX_AGGREGATES, 1]);
+        assert!(a.take().is_empty());
     }
 }

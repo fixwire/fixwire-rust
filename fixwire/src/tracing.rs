@@ -79,19 +79,28 @@ impl<S: ::tracing::Subscriber> tracing_subscriber::Layer<S> for FixwireLayer {
             return;
         }
         // What libraries log on the SDK's threads (its HTTP client, TLS) is the SDK's, not the
-        // app's: sending it would only make more of it.
-        if matches!(
-            std::thread::current().name(),
-            Some("fixwire-transport" | "fixwire-sessions")
-        ) {
+        // app's: sending it would only make more of it. Nor is what is logged while the SDK
+        // captures (from a callback, say) captured again.
+        if crate::hub::capturing()
+            || matches!(
+                std::thread::current().name(),
+                Some("fixwire-transport" | "fixwire-sessions")
+            )
+        {
             return;
         }
         let hub = Hub::current();
         let Some(client) = hub.client().filter(|c| c.is_enabled()) else {
             return;
         };
-        let mut fields = Fields::default();
-        event.record(&mut fields);
+        // The fields' `Debug` is the app's code: a panic in it stays out of the app's way.
+        let Some(fields) = crate::hub::guarded(|| {
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            fields
+        }) else {
+            return;
+        };
         if level >= self.event_level {
             let mut e = Event {
                 level: Some(level),
@@ -164,7 +173,8 @@ impl ::tracing::field::Visit for Fields {
     }
 
     fn record_f64(&mut self, field: &::tracing::field::Field, value: f64) {
-        self.values.insert(field.name().into(), value.into());
+        self.values
+            .insert(field.name().into(), crate::limits::float(value));
     }
 
     fn record_bool(&mut self, field: &::tracing::field::Field, value: bool) {

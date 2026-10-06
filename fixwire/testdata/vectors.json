@@ -221,6 +221,53 @@
       "findings": []
     },
     {
+      "name": "secrets in a query",
+      "input": "GET https://api.example.com/cb?state=af0ifjsldkj&code=4%2F0AX4XfWh7Qa&access_token=ya29.a0AfH6SMBx&client_secret=GOCSPX-x1y2z3 failed",
+      "masked": "GET https://api.example.com/cb?state=af0ifjsldkj&code=[REDACTED:secret_assignment]&access_token=[REDACTED:secret_assignment]&client_secret=[REDACTED:secret_assignment] failed",
+      "findings": [
+        "secret_assignment",
+        "secret_assignment",
+        "secret_assignment"
+      ]
+    },
+    {
+      "name": "secrets in a fragment",
+      "input": "redirect to https://app.example.com/#access_token=abcdef123456&token_type=bearer",
+      "masked": "redirect to https://app.example.com/#access_token=[REDACTED:secret_assignment]&token_type=bearer",
+      "findings": [
+        "secret_assignment"
+      ]
+    },
+    {
+      "name": "names that end a longer one",
+      "input": "accessToken: abcdef123456 refresh_token=r1r2r3r4r5r6 SECRET_KEY = 'django-insecure-x1y2z3' private_key=MIIEowIBAAK",
+      "masked": "accessToken: [REDACTED:secret_assignment] refresh_token=[REDACTED:secret_assignment] SECRET_KEY = '[REDACTED:secret_assignment]' private_key=[REDACTED:secret_assignment]",
+      "findings": [
+        "secret_assignment",
+        "secret_assignment",
+        "secret_assignment",
+        "secret_assignment"
+      ]
+    },
+    {
+      "name": "session ids and signatures",
+      "input": "PHPSESSID=abc123def456; JSESSIONID=0A1B2C3D4E5F session_id: 9f8e7d6c5b4a X-Amz-Signature=deadbeefcafe01&X-Amz-Security-Token=FwoGZXIvYXdzEJr",
+      "masked": "PHPSESSID=[REDACTED:secret_assignment]; JSESSIONID=[REDACTED:secret_assignment] session_id: [REDACTED:secret_assignment] X-Amz-Signature=[REDACTED:secret_assignment]&X-Amz-Security-Token=[REDACTED:secret_assignment]",
+      "findings": [
+        "secret_assignment",
+        "secret_assignment",
+        "secret_assignment",
+        "secret_assignment",
+        "secret_assignment"
+      ]
+    },
+    {
+      "name": "counts and codes are not secrets",
+      "input": "max_tokens=100000 input_tokens: 123456 token_count=987654 tokenizer=wordpiece2 exit code=137 error code: E_INVALID_INPUT secretary: Ada Lovelace",
+      "masked": "max_tokens=100000 input_tokens: 123456 token_count=987654 tokenizer=wordpiece2 exit code=137 error code: E_INVALID_INPUT secretary: Ada Lovelace",
+      "findings": []
+    },
+    {
       "name": "assignment already masked",
       "input": "token=[Filtered] secret=[REDACTED:email]",
       "masked": "token=[Filtered] secret=[REDACTED:email]",

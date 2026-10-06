@@ -213,8 +213,8 @@ fn case_folding_as_the_server() {
         "ba\u{17f}ic [REDACTED:http_auth] basic",
         &["http_auth"],
     );
-    // The long s is no ASCII word character: the word boundary before it
-    // needs a word character on the left.
+    // A secret's name may end a longer one: no word boundary before it, so
+    // the long s matches wherever it stands.
     assert_mask(
         "x\u{17f}ecret=abcdefgh token",
         "x\u{17f}ecret=[REDACTED:secret_assignment] token",
@@ -222,8 +222,8 @@ fn case_folding_as_the_server() {
     );
     assert_mask(
         "\u{17f}ecret=abcdefgh token",
-        "\u{17f}ecret=abcdefgh token",
-        &[],
+        "\u{17f}ecret=[REDACTED:secret_assignment] token",
+        &["secret_assignment"],
     );
     // U+0130 lower-cases to "i" for the prefilter but folds to nothing.
     assert_mask(
@@ -419,6 +419,19 @@ fn hostile_inputs_take_linear_time() {
         format!("-eyJaaaaaaaa.eyJ{}", "-eyJ".repeat(25_000)),
         format!("secret={}", "x".repeat(100_000)),
         "\u{e9}\u{1f600}\u{17f}\u{212a}".repeat(10_000),
+        // Secret names that may end a longer one, and the OAuth code.
+        format!("token{}", " ".repeat(100_000)),
+        format!("token{}=", " ".repeat(100_000)),
+        "sessid".repeat(17_000),
+        "sessid=".repeat(14_000),
+        "?code".repeat(20_000),
+        "?code=abcdef".repeat(8_000),
+        "access_token=x".repeat(7_000),
+        "X-Amz-Signature".repeat(7_000),
+        "sig:".repeat(25_000),
+        format!("private_key{}", "=".repeat(100_000)),
+        "client_secret: \"".repeat(6_000),
+        "secret_keysecret_key=".repeat(5_000),
     ];
     for (i, s) in inputs.iter().enumerate() {
         let start = Instant::now();

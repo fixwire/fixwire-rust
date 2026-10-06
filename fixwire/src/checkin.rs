@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value, json};
 
 use crate::client::{Client, new_id};
-use crate::hub::Hub;
+use crate::hub::{Hub, guarded};
 use crate::transport::Category;
 
 /// How a scheduled job's run is going.
@@ -106,20 +106,23 @@ impl Client {
         if !self.is_enabled() || check_in.monitor.trim().is_empty() {
             return None;
         }
-        let id = check_in.id.unwrap_or_else(|| new_id(16));
-        let mut body = json!({
-            "sdk": crate::sdk(), "check_in_id": id, "status": check_in.status.as_str(),
-            "environment": self.options().environment,
-        });
-        if let Some(d) = check_in.duration {
-            body["duration"] = d.as_secs_f64().into();
-        }
-        if let Some(c) = &check_in.config {
-            body["monitor_config"] = c.to_json();
-        }
-        let path = format!("/v1/check-ins/{}", percent_encode(&check_in.monitor));
-        self.send_json(&path, Category::CheckIn, &body)
-            .then_some(id)
+        guarded(|| {
+            let id = check_in.id.unwrap_or_else(|| new_id(16));
+            let mut body = json!({
+                "sdk": crate::sdk(), "check_in_id": id, "status": check_in.status.as_str(),
+                "environment": self.options().environment,
+            });
+            if let Some(d) = check_in.duration {
+                body["duration"] = d.as_secs_f64().into();
+            }
+            if let Some(c) = &check_in.config {
+                body["monitor_config"] = c.to_json();
+            }
+            let path = format!("/v1/check-ins/{}", percent_encode(&check_in.monitor));
+            self.send_json(&path, Category::CheckIn, &body)
+                .then_some(id)
+        })
+        .flatten()
     }
 }
 
@@ -226,6 +229,10 @@ impl Hub {
     /// a score.
     pub fn capture_feedback(&self, f: Feedback) -> Option<String> {
         let client = self.client().filter(|c| c.is_enabled())?;
+        guarded(|| self.send_feedback(&client, f)).flatten()
+    }
+
+    fn send_feedback(&self, client: &Client, f: Feedback) -> Option<String> {
         let message = f
             .message
             .map(|m| m.trim().to_owned())
@@ -238,7 +245,9 @@ impl Hub {
         if message.is_none() && score.is_none() {
             return None;
         }
-        let (user, span) = self.configure_scope(|s| (s.user.clone(), s.span.clone()));
+        let (user, span) = self
+            .try_configure_scope(|s| (s.user.clone(), s.span.clone()))
+            .unwrap_or_default();
         let id = new_id(16);
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)

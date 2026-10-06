@@ -282,6 +282,53 @@ fn unsampled_traces_send_nothing_but_carry_on() {
 }
 
 #[test]
+fn trace_headers_go_to_the_targets_only() {
+    let ingest = Ingest::start();
+    let hub = hub(
+        &ingest,
+        Options {
+            traces_sample_rate: 1.0,
+            trace_propagation_targets: vec![
+                "example.com".into(),
+                "https://api.other.io/v2".into(),
+                "inventory.internal:8080".into(),
+            ],
+            ..Options::default()
+        },
+    );
+    let carries = |url: &str| {
+        Hub::run(hub.clone(), || {
+            fixwire::trace("job", "task", |_| {
+                let call = fixwire::OutgoingRequest::start("GET", url);
+                let names: Vec<&str> = call.headers().iter().map(|(n, _)| *n).collect();
+                let carries = names.contains(&"traceparent");
+                call.finish(Some(200), None);
+                carries
+            })
+        })
+    };
+    for url in [
+        "https://example.com/",
+        "https://api.EXAMPLE.com/orders?id=7",
+        "https://api.other.io/v2/orders",
+        "https://ada:pw@api.other.io/v2/x",
+        "http://inventory.internal:8080/reservations",
+    ] {
+        assert!(carries(url), "{url}");
+    }
+    for url in [
+        "https://badexample.com/",
+        "https://example.com.evil.net/",
+        "https://evil.net/?next=https://example.com/",
+        "https://api.other.io/v1/orders",
+        "http://inventory.internal:9090/reservations",
+        "/orders",
+    ] {
+        assert!(!carries(url), "{url}");
+    }
+}
+
+#[test]
 fn check_ins_and_feedback() {
     let ingest = Ingest::start();
     let hub = hub(&ingest, Options::default());
@@ -384,30 +431,102 @@ fn retries_what_failed_and_pauses_what_is_limited() {
 fn pauses_past_the_clock_are_cut_to_a_day() {
     let ingest = Ingest::start();
     // Seconds the clock can't add: the sending thread lives on, errors wait a day.
-    ingest.answer([
-        (
-            200,
-            vec![("Fixwire-Rate-Limits", "18446744073709551615:error".into())],
-        ),
-        (503, vec![("Retry-After", "18446744073709551615".into())]),
-    ]);
+    ingest.answer([(
+        200,
+        vec![("Fixwire-Rate-Limits", "18446744073709551615:error".into())],
+    )]);
     let hub = hub(&ingest, Options::default());
-    let feedback = |score| {
-        Hub::run(hub.clone(), || {
-            fixwire::capture_feedback(Feedback {
-                score: Some(score),
-                ..Feedback::default()
-            })
-        })
-    };
     Hub::run(hub.clone(), || {
         fixwire::capture_message("paused for a day", Level::Info)
     });
     ingest.wait_for("/v1/logs", 1);
-    feedback(1.0); // retried in a day
-    ingest.wait_for("/v1/feedback", 1);
-    feedback(-1.0);
-    assert_eq!(ingest.wait_for("/v1/feedback", 2).len(), 2);
+    Hub::run(hub.clone(), || {
+        // Its next try is a day away, not within 5 minutes: dropped.
+        fixwire::capture_message("dropped", Level::Info);
+        fixwire::capture_feedback(Feedback {
+            score: Some(1.0),
+            ..Feedback::default()
+        });
+    });
+    flush(&hub);
+    assert_eq!(ingest.on("/v1/logs").len(), 1);
+    assert_eq!(ingest.on("/v1/feedback").len(), 1, "other data goes on");
+}
+
+#[test]
+fn a_5xx_that_says_how_long_pauses_everything() {
+    let ingest = Ingest::start();
+    ingest.answer([(503, vec![("Retry-After", "1".into())])]);
+    let hub = hub(&ingest, Options::default());
+    let start = std::time::Instant::now();
+    Hub::run(hub.clone(), || {
+        fixwire::capture_message("unavailable", Level::Info)
+    });
+    ingest.wait_for("/v1/logs", 1);
+    Hub::run(hub.clone(), || {
+        fixwire::capture_feedback(Feedback {
+            score: Some(1.0),
+            ..Feedback::default()
+        })
+    });
+    flush(&hub);
+    assert!(
+        start.elapsed() >= Duration::from_secs(1),
+        "everything waited"
+    );
+    assert_eq!(ingest.on("/v1/logs").len(), 2, "tried again");
+    assert_eq!(ingest.on("/v1/feedback").len(), 1);
+
+    // A day and a second, or a date two days away, is a day: what waits is dropped.
+    for retry_after in ["86401".to_owned(), http_date_in(2 * 86_400)] {
+        let ingest = Ingest::start();
+        ingest.answer([(429, vec![("Retry-After", retry_after.clone())])]);
+        let hub = self::hub(&ingest, Options::default());
+        Hub::run(hub.clone(), || {
+            fixwire::capture_message("limited", Level::Info);
+        });
+        ingest.wait_for("/v1/logs", 1);
+        Hub::run(hub.clone(), || {
+            fixwire::capture_feedback(Feedback {
+                score: Some(1.0),
+                ..Feedback::default()
+            })
+        });
+        flush(&hub);
+        assert_eq!(ingest.on("/v1/logs").len(), 1, "{retry_after}");
+        assert!(ingest.on("/v1/feedback").is_empty(), "{retry_after}");
+    }
+}
+
+/// An HTTP date `secs` from now: `Thu, 08 Oct 2026 10:00:00 GMT`.
+fn http_date_in(secs: u64) -> String {
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + secs;
+    let (days, rem) = ((t / 86_400) as i64, t % 86_400);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let names = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let weekdays = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    format!(
+        "{}, {day:02} {} {year} {:02}:{:02}:{:02} GMT",
+        weekdays[(days % 7) as usize],
+        names[(month - 1) as usize],
+        rem / 3_600,
+        rem % 3_600 / 60,
+        rem % 60
+    )
 }
 
 #[test]
@@ -463,23 +582,230 @@ fn closing_takes_no_longer_than_asked() {
 }
 
 #[test]
-fn events_over_a_megabyte_go_without_their_extras_or_not_at_all() {
+fn events_over_a_megabyte_go_without_breadcrumbs_then_contexts_or_not_at_all() {
     let ingest = Ingest::start();
-    let hub = hub(&ingest, Options::default());
-    let huge = "x".repeat(1_100_000);
-    let (smaller, dropped) = Hub::run(hub.clone(), || {
-        fixwire::configure_scope(|s| s.set_extra("dump", huge.clone()));
-        let smaller = fixwire::capture_message("the report is too large", Level::Error);
-        fixwire::configure_scope(|s| s.set_extra("dump", Value::Null));
-        (smaller, fixwire::capture_message(huge, Level::Error))
+    let hub = hub(
+        &ingest,
+        Options {
+            error_budget: fixwire::ErrorBudget {
+                disabled: true,
+                ..Default::default()
+            },
+            ..Options::default()
+        },
+    );
+    // About 2 MB: 100 lists of 20 strings of 1000 bytes.
+    let heavy = || -> serde_json::Map<String, Value> {
+        (0..100)
+            .map(|i| (format!("k{i}"), json!(vec!["x".repeat(1000); 20])))
+            .collect()
+    };
+    let sent = Hub::run(hub.clone(), || {
+        let mut sent = Vec::new();
+        for _ in 0..100 {
+            fixwire::add_breadcrumb(Breadcrumb {
+                message: Some("heavy".into()),
+                data: (0..20)
+                    .map(|i| (i.to_string(), json!("y".repeat(1000))))
+                    .collect(),
+                ..Breadcrumb::default()
+            });
+        }
+        fixwire::configure_scope(|s| {
+            s.set_context(
+                "light",
+                json!({"plan": "team"}).as_object().unwrap().clone(),
+            )
+        });
+        sent.push(fixwire::capture_message(
+            "without breadcrumbs",
+            Level::Error,
+        ));
+        fixwire::configure_scope(|s| s.set_context("heavy", heavy()));
+        sent.push(fixwire::capture_message("without contexts", Level::Error));
+        fixwire::configure_scope(|s| {
+            s.set_context("heavy", serde_json::Map::new());
+            s.set_extra("dump", Value::Object(heavy()));
+        });
+        sent.push(fixwire::capture_message("dropped", Level::Error));
+        sent
     });
     flush(&hub);
-    assert!(smaller.is_some());
-    assert_eq!(dropped, None);
+    assert!(sent[0].is_some() && sent[1].is_some());
+    assert_eq!(sent[2], None, "still over without breadcrumbs and contexts");
     let records = ingest.records();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0]["body"]["stringValue"], "the report is too large");
-    assert!(!attrs(&records[0]).contains_key("dump"));
+    assert_eq!(records.len(), 2);
+    let (first, second) = (attrs(&records[0]), attrs(&records[1]));
+    assert!(!first.contains_key("fixwire.breadcrumbs"));
+    assert_eq!(
+        first["fixwire.contexts"],
+        json!({"light": {"plan": "team"}})
+    );
+    assert!(!second.contains_key("fixwire.breadcrumbs"));
+    assert!(!second.contains_key("fixwire.contexts"));
+    for r in &records {
+        assert!(serde_json::to_vec(r).unwrap().len() <= 1 << 20);
+    }
+}
+
+#[test]
+fn strings_are_cut_after_redaction_and_values_bounded() {
+    let ingest = Ingest::start();
+    let hub = hub(&ingest, Options::default());
+    let (begin, end) = (
+        concat!("-----BEGIN RSA PRIVATE ", "KEY-----\n"),
+        concat!("\n-----END RSA PRIVATE ", "KEY-----"),
+    );
+    let pem = format!("{begin}{}{end}", "MIIEpAIBAAKCAQEA".repeat(100));
+    Hub::run(hub.clone(), || {
+        // 1025 bytes, "é" across the cut.
+        let message = format!("{}{}", "a".repeat(1020), "é".repeat(2)) + "a";
+        fixwire::capture_message(message, Level::Warning);
+        // The cut (at 1024 bytes) goes through the key: still masked whole.
+        fixwire::capture_message(format!("{} {pem} tail", "b".repeat(900)), Level::Warning);
+        let deep = (0..12).fold(json!("bottom"), |v, _| json!({"next": v}));
+        fixwire::configure_scope(|s| s.set_extra("deep", deep));
+        fixwire::configure_scope(|s| s.set_extra("wide", json!((0..150).collect::<Vec<_>>())));
+        fixwire::capture_message(format!("{}😀", "c".repeat(1022)), Level::Warning);
+    });
+    flush(&hub);
+    let records = ingest.records();
+    let body = |i: usize| {
+        records[i]["body"]["stringValue"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(body(0), format!("{}...", "a".repeat(1020)));
+    assert_eq!(
+        body(1),
+        format!("{} [REDACTED:private_key] tail", "b".repeat(900)),
+        "masked, then short enough"
+    );
+    // 1026 bytes: the emoji goes, "..." ends it within 1024.
+    assert_eq!(body(2), format!("{}...", "c".repeat(1021)));
+    let a = attrs(&records[2]);
+    let mut deep = &a["deep"];
+    for _ in 0..10 {
+        deep = &deep["next"];
+    }
+    assert_eq!(deep, &json!("[Object]"), "ten levels deep");
+    assert_eq!(a["wide"].as_array().unwrap().len(), 100);
+}
+
+#[test]
+fn frames_keep_the_newest_and_failing_callbacks_are_skipped() {
+    let ingest = Ingest::start();
+    let hub = hub(
+        &ingest,
+        Options {
+            before_send: Some(Arc::new(|e: fixwire::Event| {
+                if e.message.as_deref() == Some("before_send panics") {
+                    panic!("a bug in before_send");
+                }
+                Some(e)
+            })),
+            before_breadcrumb: Some(Arc::new(|b: Breadcrumb| {
+                if b.message.as_deref() == Some("kept as it was") {
+                    panic!("a bug in before_breadcrumb");
+                }
+                Some(b)
+            })),
+            ..Options::default()
+        },
+    );
+    let frames: Vec<fixwire::Frame> = (0..101)
+        .map(|i| fixwire::Frame {
+            function: format!("f{i}"),
+            ..fixwire::Frame::default()
+        })
+        .collect();
+    let chain: Vec<fixwire::Exception> = (0..11)
+        .map(|i| fixwire::Exception {
+            ty: format!("E{i}"),
+            message: "deep".into(),
+            frames: frames.clone(),
+            ..fixwire::Exception::default()
+        })
+        .collect();
+    let sent = Hub::run(hub.clone(), || {
+        fixwire::add_breadcrumb(Breadcrumb::new("app", "kept as it was"));
+        let mut event = fixwire::Event::default();
+        event.exceptions = chain;
+        let a = fixwire::capture_event(event);
+        (
+            a,
+            fixwire::capture_message("before_send panics", Level::Info),
+        )
+    });
+    flush(&hub);
+    assert!(sent.0.is_some() && sent.1.is_some(), "sent as they were");
+    let records = ingest.records();
+    let a = attrs(&records[0]);
+    let chain = a["fixwire.exceptions"].as_array().unwrap();
+    assert_eq!(chain.len(), 10);
+    let frames = chain[0]["frames"].as_array().unwrap();
+    assert_eq!(frames.len(), 100);
+    assert_eq!(
+        (
+            frames[0]["function"].as_str(),
+            frames[99]["function"].as_str()
+        ),
+        (Some("f1"), Some("f100")),
+        "the oldest goes"
+    );
+    assert_eq!(a["fixwire.breadcrumbs"][0]["message"], "kept as it was");
+    assert_eq!(records[1]["body"]["stringValue"], "before_send panics");
+}
+
+#[test]
+fn spans_go_in_requests_of_at_most_100_and_5_mb() {
+    let ingest = Ingest::start();
+    let hub = hub(
+        &ingest,
+        Options {
+            traces_sample_rate: 1.0,
+            ..Options::default()
+        },
+    );
+    Hub::run(hub.clone(), || {
+        fixwire::trace("job", "task", |job| {
+            for i in 0..250 {
+                fixwire::trace(format!("step {i}"), "task", |_| ());
+            }
+            // About 6 MB of attributes: dropped alone.
+            fixwire::trace("huge", "task", |s| {
+                for i in 0..127 {
+                    s.set_attribute(format!("a{i}"), json!(vec!["z".repeat(1000); 50]));
+                }
+            });
+            // 200 attributes: 127 and fixwire.op are kept.
+            fixwire::trace("many", "task", |s| {
+                for i in 0..200 {
+                    s.set_attribute(format!("b{i:03}"), i);
+                }
+            });
+            job.set_attribute("steps", 250);
+        });
+    });
+    flush(&hub);
+    let requests = ingest.on("/v1/traces");
+    let sizes: Vec<usize> = requests
+        .iter()
+        .map(|r| {
+            r.body["resourceSpans"][0]["scopeSpans"][0]["spans"]
+                .as_array()
+                .unwrap()
+                .len()
+        })
+        .collect();
+    assert_eq!(sizes, [100, 100, 52], "250 steps, many and the job");
+    let spans = ingest.spans();
+    assert!(spans.iter().all(|s| s["name"] != "huge"));
+    let many = spans.iter().find(|s| s["name"] == "many").unwrap();
+    let a = attrs(many);
+    assert_eq!(a.len(), 128);
+    assert!(a.contains_key("fixwire.op") && a.contains_key("b126") && !a.contains_key("b127"));
 }
 
 #[test]

@@ -242,12 +242,25 @@ pub(super) static REGISTRY: [Detector; 22] = [
         ),
     )
     .validated(validators::credential_like),
+    // A value given to a secret's name, in text, config and URLs. The name may
+    // end a longer one (access_token, client_secret, csrfToken, PHPSESSID,
+    // X-Amz-Signature); an OAuth code counts in a query or fragment only.
     detector(
         "secret_assignment",
-        &["pass", "secret", "token", "api_key", "apikey", "api-key", "pwd"],
+        &[
+            "pass",
+            "pwd",
+            "secret",
+            "key",
+            "token",
+            "credential",
+            "sess",
+            "sig",
+            "code",
+        ],
         ANY_CASE,
         pattern(
-            r#"(?i)(?-u:\b)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)["']?[\t\n\f\r ]*[:=][\t\n\f\r ]*["']?([^\t\n\f\r "',;&]{6,})"#,
+            r#"(?i)(?:password|passwd|pwd|secret(?:[_-]?key)?|private[_-]?key|token|api[_-]?key|access[_-]?key|credentials?|sess(?:ion)?[_-]?id|sig(?:nature)?|[?&#]code)["']?[\t\n\f\r ]*[:=][\t\n\f\r ]*["']?([^\t\n\f\r "',;&]{6,})"#,
             1,
         ),
     )

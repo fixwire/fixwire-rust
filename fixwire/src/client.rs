@@ -9,7 +9,11 @@ use serde_json::{Map, Value};
 
 use crate::budget::{Budget, issue_of};
 use crate::dsn::{Dsn, InvalidDsn};
+use crate::http::ComparedUrl;
+use crate::hub::{MAX_CHAIN, guarded};
+use crate::limits;
 use crate::options::Options;
+use crate::otlp::Export;
 use crate::redaction::Redactor;
 use crate::sessions::Aggregates;
 use crate::transport::{Category, Request, Transport};
@@ -96,29 +100,43 @@ impl Client {
             }
         }
         if let Some(before) = &self.opts.before_send {
-            e = before(e)?;
+            // A callback that panics is skipped: the event goes as it was.
+            match guarded(|| before(e.clone())) {
+                Some(changed) => e = changed?,
+                None => self.log(|| "before_send panicked: the event goes as it was".into()),
+            }
+        }
+        // A chain of at most 10, each with the newest `max_stack_frames`.
+        e.exceptions.truncate(MAX_CHAIN);
+        for x in &mut e.exceptions {
+            let older = x.frames.len().saturating_sub(self.opts.max_stack_frames);
+            x.frames.drain(..older);
         }
         let id = e.event_id.clone();
-        let mut body = serde_json::to_vec(&self.logs_export(self.event_record(&e))).ok()?;
-        if body.len() > MAX_EVENT_BYTES {
-            // Fixwire refuses it: it goes without its breadcrumbs, details and source lines, or
-            // not at all.
+        let mut record = serde_json::to_vec(&self.event_record(&e)).ok()?;
+        // Fixwire refuses more: it goes without its breadcrumbs, then without its contexts (Rust
+        // frames have no local variables to leave out between), or not at all.
+        if record.len() > MAX_EVENT_BYTES && !e.breadcrumbs.is_empty() {
             e.breadcrumbs.clear();
-            e.extra.clear();
-            for f in e.exceptions.iter_mut().flat_map(|x| x.frames.iter_mut()) {
-                f.context_line = None;
-                f.pre_context.clear();
-                f.post_context.clear();
-            }
-            body = serde_json::to_vec(&self.logs_export(self.event_record(&e))).ok()?;
-            if body.len() > MAX_EVENT_BYTES {
-                self.log(|| "dropped an event: larger than 1 MB".into());
-                return None;
-            }
+            record = serde_json::to_vec(&self.event_record(&e)).ok()?;
         }
+        if record.len() > MAX_EVENT_BYTES && !e.contexts.is_empty() {
+            e.contexts.clear();
+            record = serde_json::to_vec(&self.event_record(&e)).ok()?;
+        }
+        if record.len() > MAX_EVENT_BYTES {
+            self.log(|| "dropped an event: larger than 1 MB".into());
+            return None;
+        }
+        let body = self.export(Export::Logs, &[record]);
         transport
             .send(Request::json("/v1/logs", Category::Error, body))
             .then_some(id)
+    }
+
+    /// Queues a request.
+    pub(crate) fn send(&self, request: Request) -> bool {
+        self.transport.as_ref().is_some_and(|t| t.send(request))
     }
 
     /// Queues a Fixwire JSON request.
@@ -132,14 +150,16 @@ impl Client {
         }
     }
 
-    /// Masks secrets and personal data in `m`, but for the keys in `skip`.
+    /// Masks secrets and personal data in `m`, but for the keys in `skip`,
+    /// and cuts its strings to `max_value_length`.
     pub(crate) fn scrub(&self, mut m: Map<String, Value>, skip: &[&str]) -> Map<String, Value> {
-        let Some(redactor) = &self.redactor else {
-            return m;
-        };
         let kept: Vec<(String, Value)> = skip.iter().filter_map(|k| m.remove_entry(*k)).collect();
-        let (masked, _) = redactor.walk(&Value::Object(m));
-        let mut out = match masked {
+        let limit = self.opts.max_value_length;
+        let out = match &self.redactor {
+            Some(redactor) => redactor.walk_within(&Value::Object(m), limit).0,
+            None => limits::cut_strings(Value::Object(m), limit),
+        };
+        let mut out = match out {
             Value::Object(o) => o,
             _ => Map::new(),
         };
@@ -147,21 +167,24 @@ impl Client {
         out
     }
 
-    /// Masks secrets and personal data in `s`.
-    pub(crate) fn mask(&self, s: &str) -> String {
+    /// `s` as it is sent: secrets and personal data masked, then cut to
+    /// `max_value_length`.
+    pub(crate) fn clean(&self, s: &str) -> String {
+        let limit = self.opts.max_value_length;
         match &self.redactor {
-            Some(r) if !s.is_empty() => r.mask(s).0.into_owned(),
-            _ => s.to_owned(),
+            Some(r) => r.mask_within(s, limit).0.into_owned(),
+            None => limits::cut(s, limit, false).into_owned(),
         }
     }
 
-    /// Whether trace headers may go to `url`: it holds one of the
-    /// `trace_propagation_targets`.
+    /// Whether trace headers may go to `url`: it matches one of the
+    /// `trace_propagation_targets` (see `Options`).
     pub fn should_propagate(&self, url: &str) -> bool {
+        let url = ComparedUrl::of(url);
         self.opts
             .trace_propagation_targets
             .iter()
-            .any(|t| !t.is_empty() && url.contains(t.as_str()))
+            .any(|t| url.matches(t))
     }
 
     /// Waits until what was captured is sent, or `timeout`; false when time

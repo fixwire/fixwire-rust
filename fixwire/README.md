@@ -31,7 +31,9 @@ The DSN is your project's publishable key and the ingest host,
 
 **What's different**
 - Secrets and personal data are masked on the device, with the same rules
-  as the Fixwire server (`redact: false` turns it off).
+  as the Fixwire server (`redact: false` turns it off), before long strings
+  are cut (`max_value_length`, 1024 bytes by default): a secret the cut goes
+  through is still masked.
 - A crash loop costs a few events and a count, not your quota
   (`error_budget`).
 - Captures never block: one thread sends from a bounded queue, retries with
@@ -110,6 +112,22 @@ HTTP client:
 let call = fixwire::OutgoingRequest::start("POST", "http://inventory.internal/reservations");
 // add call.headers() to the request: trace headers, only for trace_propagation_targets
 call.finish(Some(201), None);
+```
+
+Trace headers go only where `trace_propagation_targets` says (nowhere by
+default). URLs are compared without their user info, query and fragment: a
+target with `://` matches URLs that start with it
+(`https://api.example.com/v2`), one starting with `/` matches relative URLs
+whose path starts with it, and any other is a host, with a port if it has
+one: `example.com` matches `example.com` and `api.example.com`, not
+`badexample.com` or `example.com.evil.net`.
+
+```rust,no_run
+let _fixwire = fixwire::init(fixwire::Options {
+    traces_sample_rate: 0.2,
+    trace_propagation_targets: vec!["inventory.internal".into(), "https://api.example.com/v2".into()],
+    ..Default::default()
+});
 ```
 
 The `tracing` feature's layer makes `tracing` events breadcrumbs (info and

@@ -14,9 +14,6 @@ use crate::hub::lock;
 use crate::options::Options;
 use crate::types::Frame;
 
-/// Bounds a captured stack.
-const MAX_FRAMES: usize = 100;
-
 /// The calling thread's stack, the oldest call first, without the SDK's own
 /// frames.
 pub(crate) fn capture(opts: &Options) -> Vec<Frame> {
@@ -84,7 +81,8 @@ fn frames_of(bt: &Backtrace, opts: &Options, from_panic: bool, skip: &[&str]) ->
                 && !is_sdk_file(file.as_deref())
                 && !skip.contains(&root_crate(function))
         })
-        .take(MAX_FRAMES)
+        // The newest, nearest to where it failed.
+        .take(opts.max_stack_frames)
         .map(|(function, abs_path, line, column)| {
             let (module, function) = split_function(&function);
             let in_app = in_app(
@@ -109,7 +107,7 @@ fn frames_of(bt: &Backtrace, opts: &Options, from_panic: bool, skip: &[&str]) ->
     frames.reverse();
     if opts.context_lines > 0 {
         for f in frames.iter_mut().filter(|f| f.in_app) {
-            add_context(f, opts.context_lines);
+            add_context(f, opts.context_lines.min(MAX_CONTEXT_LINES));
         }
     }
     frames
@@ -349,22 +347,32 @@ fn short_file(path: &str, root: Option<&Path>) -> String {
     path
 }
 
-/// The lines of the files frames point to, kept for the next events.
-static SOURCES: LazyLock<Mutex<HashMap<String, Vec<String>>>> = LazyLock::new(Default::default);
+/// The lines of the files frames point to, kept for the next events: files
+/// of at most 10 MB are read, and at most 64 files and 40 MB kept.
+#[derive(Default)]
+struct Sources {
+    files: HashMap<String, Vec<String>>,
+    bytes: u64,
+}
+static SOURCES: LazyLock<Mutex<Sources>> = LazyLock::new(Default::default);
 const MAX_SOURCE_FILES: usize = 64;
-const MAX_SOURCE_BYTES: u64 = 1 << 20;
+const MAX_SOURCE_BYTES: u64 = 10 << 20;
+const MAX_CACHED_BYTES: u64 = 4 * MAX_SOURCE_BYTES;
+/// The source lines read above and below a frame's line, at most.
+const MAX_CONTEXT_LINES: usize = 5;
 
 fn add_context(f: &mut Frame, around: usize) {
     let (Some(path), Some(line)) = (f.abs_path.as_deref(), f.line) else {
         return;
     };
-    let mut sources = lock(&SOURCES);
+    let mut guard = lock(&SOURCES);
+    let Sources {
+        files: sources,
+        bytes: cached,
+    } = &mut *guard;
     if !sources.contains_key(path) {
-        if sources.len() >= MAX_SOURCE_FILES {
-            sources.clear();
-        }
         // Regular files only: opening a FIFO waits for a writer, and a device may never end.
-        let lines = std::fs::metadata(path)
+        let text = std::fs::metadata(path)
             .ok()
             .filter(|m| m.is_file() && m.len() <= MAX_SOURCE_BYTES)
             .and_then(|_| std::fs::File::open(path).ok())
@@ -375,9 +383,14 @@ fn add_context(f: &mut Frame, around: usize) {
                     .ok()
                     .map(|_| text)
             })
-            .map(|s| s.lines().map(str::to_owned).collect())
             .unwrap_or_default();
-        sources.insert(path.to_owned(), lines);
+        let size = text.len() as u64;
+        if sources.len() >= MAX_SOURCE_FILES || *cached + size > MAX_CACHED_BYTES {
+            sources.clear();
+            *cached = 0;
+        }
+        *cached += size;
+        sources.insert(path.to_owned(), text.lines().map(str::to_owned).collect());
     }
     let lines = &sources[path];
     let i = line as usize;
