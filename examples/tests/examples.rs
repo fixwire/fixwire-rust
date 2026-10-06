@@ -4,8 +4,11 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
